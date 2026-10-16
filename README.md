@@ -35,6 +35,68 @@ No ACP provider is downloaded or executed merely by starting the gateway.
 Selecting a built-in `npx` provider may download that provider package on first
 use.
 
+## Connect an AHP client
+
+AHP-ACP Gateway is not tied to VS Code. Any client that implements compatible
+AHP 1.x JSON-RPC over WebSocket can connect to:
+
+```text
+ws://127.0.0.1:8765/ahp
+```
+
+The client can initialize the root channel, discover providers, create a
+session, subscribe to its default chat, and dispatch normal AHP actions. See
+the [Agent Host Protocol documentation](https://microsoft.github.io/agent-host-protocol/)
+for client implementations and protocol details.
+
+### VS Code Agent Window
+
+VS Code Agent Window is the primary client used for end-to-end compatibility
+testing in this repository.
+
+1. Start the gateway:
+
+   ```sh
+   npx --yes ahp-acp-gateway
+   ```
+
+2. Run **Preferences: Open User Settings (JSON)** from the VS Code Command
+   Palette and add the remote Agent Host:
+
+   ```json
+   {
+     "chat.remoteAgentHosts": [
+       {
+         "name": "AHP-ACP Gateway",
+         "address": "127.0.0.1:8765/ahp"
+       }
+     ]
+   }
+   ```
+
+   Merge `chat.remoteAgentHosts` with any existing entries rather than adding
+   the setting twice. If the gateway uses another host, port, or path, update
+   `address` accordingly.
+
+3. Open the Agents window by running **Chat: Open Agents Window**, using
+   **Open in Agents** in the title bar, or running:
+
+   ```sh
+   code --agents
+   ```
+
+4. Select **New**, choose a folder, and select **AHP-ACP Gateway** as the
+   remote Agent Host.
+5. Use the agent picker to select an ACP provider such as GitHub Copilot,
+   OpenCode, or Codex.
+6. Select a model in the native model picker, configure the available session
+   options, and send a prompt.
+
+![VS Code Agent Window connected to AHP-ACP Gateway with an ACP provider and model selected](docs/images/vscode-agent-window.png)
+
+If the host does not appear, verify that the gateway is running and reopen the
+Agents window after saving the setting.
+
 ## Install globally
 
 ```sh

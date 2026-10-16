@@ -13,6 +13,9 @@
   "bugs": {
     "url": "https://github.com/formulahendry/ahp-acp-gateway/issues"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "keywords": [
     "ahp",
     "acp",
@@ -26,10 +29,11 @@
     "node": ">=24"
   },
   "bin": {
-    "ahp-acp-gateway": "./dist/src/cli.js"
+    "ahp-acp-gateway": "dist/src/cli.js"
   },
   "files": [
     "dist/src",
+    "docs",
     "ahp-acp-gateway.default.json",
     "ahp-acp-gateway.example.json",
     "README.md",
@@ -37,13 +41,15 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc -p tsconfig.json",
     "dev": "tsx src/cli.ts",
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --test --import tsx test/*.test.ts",
     "check": "npm run lint && npm run typecheck && npm test && npm run build",
-    "prepublishOnly": "npm run check"
+    "prepublishOnly": "npm run lint && npm run typecheck && npm test",
+    "prepack": "npm run build"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^1.8.0",
