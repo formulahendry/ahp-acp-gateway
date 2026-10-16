@@ -1,0 +1,160 @@
+{
+  "version": 1,
+  "listener": {
+    "host": "127.0.0.1",
+    "port": 8765,
+    "path": "/ahp",
+    "tlsTerminated": false,
+    "allowedOrigins": [],
+    "allowAnyOrigin": true
+  },
+  "auth": {},
+  "database": {
+    "path": "~/.ahp-acp-gateway/ahp-acp-gateway.db"
+  },
+  "replay": {
+    "maxActions": 10000
+  },
+  "providerDefaults": {
+    "startupTimeoutMs": 15000,
+    "requestTimeoutMs": 300000,
+    "shutdownTimeoutMs": 5000,
+    "stderrTailBytes": 16384
+  },
+  "providers": [
+    {
+      "id": "copilot",
+      "enabled": true,
+      "displayName": "GitHub Copilot",
+      "description": "GitHub Copilot CLI in Agent Client Protocol mode.",
+      "command": "npx",
+      "args": ["--yes", "@github/copilot", "--acp"],
+      "startupTimeoutMs": 120000,
+      "installHint": "Run npm install --global @github/copilot, or keep the default lazy npx launcher."
+    },
+    {
+      "id": "claude",
+      "enabled": true,
+      "displayName": "Claude Code",
+      "description": "Official ACP adapter for the Claude Agent SDK.",
+      "command": "npx",
+      "args": ["--yes", "@agentclientprotocol/claude-agent-acp"],
+      "startupTimeoutMs": 120000,
+      "installHint": "Run npm install --global @agentclientprotocol/claude-agent-acp, or keep the default lazy npx launcher."
+    },
+    {
+      "id": "gemini",
+      "enabled": true,
+      "displayName": "Gemini CLI",
+      "description": "Google Gemini CLI using its experimental ACP transport.",
+      "command": "npx",
+      "args": ["--yes", "@google/gemini-cli", "--experimental-acp"],
+      "startupTimeoutMs": 120000,
+      "installHint": "Run npm install --global @google/gemini-cli, or keep the default lazy npx launcher."
+    },
+    {
+      "id": "qwen",
+      "enabled": true,
+      "displayName": "Qwen Code",
+      "description": "Qwen Code in ACP mode with skills enabled.",
+      "command": "npx",
+      "args": ["--yes", "@qwen-code/qwen-code", "--acp", "--experimental-skills"],
+      "startupTimeoutMs": 120000,
+      "installHint": "Run npm install --global @qwen-code/qwen-code, or keep the default lazy npx launcher."
+    },
+    {
+      "id": "auggie",
+      "enabled": true,
+      "displayName": "Auggie",
+      "description": "Augment Code Auggie CLI in ACP mode.",
+      "command": "npx",
+      "args": ["--yes", "@augmentcode/auggie", "--acp"],
+      "env": {
+        "AUGMENT_DISABLE_AUTO_UPDATE": "1"
+      },
+      "startupTimeoutMs": 120000,
+      "installHint": "Run npm install --global @augmentcode/auggie, or keep the default lazy npx launcher."
+    },
+    {
+      "id": "qoder",
+      "enabled": true,
+      "displayName": "Qoder CLI",
+      "description": "Qoder CLI in Agent Client Protocol mode.",
+      "command": "npx",
+      "args": ["--yes", "@qoder-ai/qodercli", "--acp"],
+      "startupTimeoutMs": 120000,
+      "installHint": "Run npm install --global @qoder-ai/qodercli, or keep the default lazy npx launcher.",
+      "authHint": "Run npx --yes @qoder-ai/qodercli login, then retry the session."
+    },
+    {
+      "id": "codex",
+      "enabled": true,
+      "displayName": "Codex CLI",
+      "description": "Official Agent Client Protocol adapter for OpenAI Codex CLI.",
+      "command": "npx",
+      "args": ["--yes", "@agentclientprotocol/codex-acp"],
+      "startupTimeoutMs": 120000,
+      "installHint": "Run npm install --global @agentclientprotocol/codex-acp, or keep the default lazy npx launcher."
+    },
+    {
+      "id": "opencode",
+      "enabled": true,
+      "displayName": "OpenCode",
+      "description": "OpenCode coding agent in ACP server mode.",
+      "command": "npx",
+      "args": ["--yes", "@opencode/cli", "acp"],
+      "startupTimeoutMs": 120000,
+      "installHint": "Run npm install --global @opencode/cli, or keep the default lazy npx launcher."
+    },
+    {
+      "id": "openclaw",
+      "enabled": true,
+      "displayName": "OpenClaw",
+      "description": "OpenClaw coding agent in ACP mode.",
+      "command": "npx",
+      "args": ["--yes", "openclaw", "acp"],
+      "startupTimeoutMs": 120000,
+      "installHint": "Run npm install --global openclaw, or keep the default lazy npx launcher."
+    },
+    {
+      "id": "kiro",
+      "enabled": true,
+      "displayName": "Kiro CLI",
+      "description": "Kiro CLI in ACP mode.",
+      "command": "kiro-cli",
+      "args": ["acp"],
+      "startupTimeoutMs": 30000,
+      "installHint": "Install Kiro CLI and ensure kiro-cli is available on PATH."
+    },
+    {
+      "id": "hermes",
+      "enabled": true,
+      "displayName": "Hermes Agent",
+      "description": "Hermes Agent in ACP mode.",
+      "command": "hermes",
+      "args": ["acp"],
+      "startupTimeoutMs": 30000,
+      "installHint": "Install Hermes Agent and ensure hermes is available on PATH."
+    },
+    {
+      "id": "kimi",
+      "enabled": true,
+      "displayName": "Kimi CLI",
+      "description": "Moonshot AI Kimi CLI in ACP mode.",
+      "command": "kimi",
+      "args": ["acp"],
+      "startupTimeoutMs": 30000,
+      "installHint": "Install Kimi CLI and ensure kimi is available on PATH."
+    },
+    {
+      "id": "pi",
+      "enabled": true,
+      "displayName": "Pi ACP",
+      "description": "ACP adapter for the Pi coding agent.",
+      "command": "npx",
+      "args": ["--yes", "pi-acp"],
+      "startupTimeoutMs": 120000,
+      "installHint": "Run npm install --global pi-acp, or keep the default lazy npx launcher."
+    }
+  ]
+}

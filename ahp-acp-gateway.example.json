@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "listener": {
+    "port": 9876,
+    "allowAnyOrigin": false,
+    "allowedOrigins": [
+      "vscode-file://vscode-app",
+      "https://trusted-client.example"
+    ]
+  },
+  "replay": {
+    "maxActions": 20000
+  },
+  "providers": [
+    {
+      "id": "gemini",
+      "enabled": false
+    },
+    {
+      "id": "codex",
+      "command": "npx",
+      "args": [
+        "--yes",
+        "@agentclientprotocol/codex-acp@2.2.2"
+      ]
+    },
+    {
+      "id": "my-agent",
+      "displayName": "My ACP Agent",
+      "description": "A locally installed custom ACP v1 agent.",
+      "command": "my-agent",
+      "args": [
+        "acp"
+      ],
+      "env": {
+        "EXAMPLE_SETTING": "value"
+      },
+      "installHint": "Install my-agent and ensure it is available on PATH."
+    }
+  ]
+}

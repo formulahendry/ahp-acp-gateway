@@ -1,0 +1,8 @@
+node_modules/
+dist/
+coverage/
+*.db
+*.db-shm
+*.db-wal
+.env
+ahp-acp-gateway.local.json

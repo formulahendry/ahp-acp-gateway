@@ -1,0 +1,63 @@
+{
+  "name": "ahp-acp-gateway",
+  "version": "0.1.0",
+  "description": "Universal AHP server that connects Agent Host Protocol clients to ACP v1 agents",
+  "type": "module",
+  "license": "MIT",
+  "author": "formulahendry",
+  "homepage": "https://github.com/formulahendry/ahp-acp-gateway#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/formulahendry/ahp-acp-gateway.git"
+  },
+  "bugs": {
+    "url": "https://github.com/formulahendry/ahp-acp-gateway/issues"
+  },
+  "keywords": [
+    "ahp",
+    "acp",
+    "agent-host-protocol",
+    "agent-client-protocol",
+    "ai-agent",
+    "gateway",
+    "vscode"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "ahp-acp-gateway": "./dist/src/cli.js"
+  },
+  "files": [
+    "dist/src",
+    "ahp-acp-gateway.default.json",
+    "ahp-acp-gateway.example.json",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli.ts",
+    "lint": "eslint .",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test --import tsx test/*.test.ts",
+    "check": "npm run lint && npm run typecheck && npm test && npm run build",
+    "prepublishOnly": "npm run check"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^1.8.0",
+    "@microsoft/agent-host-protocol": "^1.0.0",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.37.0",
+    "@types/node": "^24.7.2",
+    "@types/ws": "^8.18.1",
+    "eslint": "^9.37.0",
+    "globals": "^16.4.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.46.1"
+  }
+}
