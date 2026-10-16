@@ -122,10 +122,13 @@ context metadata; they are not represented as input/output turn token counts.
 
 ## Unsupported protocol surfaces
 
-The host implements the read-only `resourceList` and `resourceResolve` surface
-required by remote folder pickers. It also implements a basic pipe-backed local
-shell terminal lifecycle for VS Code (`createTerminal`, terminal subscription,
-input/output, resize state, and disposal). It does not claim PTY or command
-detection support. Multi-chat, changesets, writable resources, and ACP v2 remain
-unsupported. Calls to unsupported methods return JSON-RPC `Method not found` or
-`Invalid params`; they never return empty success placeholders.
+The host implements the read-only `resourceList`, `resourceResolve`, and
+`resourceRead` surfaces required by remote folder pickers and file opening.
+Reads are limited to the gateway working directory and persisted session
+working directories, with symlinks resolved before the boundary check. It also
+implements a basic pipe-backed local shell terminal lifecycle for VS Code
+(`createTerminal`, terminal subscription, input/output, resize state, and
+disposal). It does not claim PTY or command detection support. Multi-chat,
+changesets, writable resources, and ACP v2 remain unsupported. Calls to
+unsupported methods return JSON-RPC `Method not found` or `Invalid params`;
+they never return empty success placeholders.

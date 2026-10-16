@@ -1,7 +1,8 @@
 import { timingSafeEqual } from 'node:crypto';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { lstat, readdir, realpath, stat } from 'node:fs/promises';
+import { lstat, readFile, readdir, realpath, stat } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
+import { extname, isAbsolute, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
   ActionType,
@@ -75,7 +76,6 @@ export class GatewayServer {
         product: 'AHP-ACP Gateway',
         acpVersion: 1,
         unsupported: [
-          'resourceContents',
           'resourceWrites',
           'terminalPty',
           'terminalCommandDetection',
@@ -241,6 +241,8 @@ export class GatewayServer {
         return this.listSessions(params);
       case 'resolveSessionConfig':
         return this.resolveSessionConfig(params);
+      case 'resourceRead':
+        return this.resourceRead(params);
       case 'resourceList':
         return this.resourceList(params);
       case 'resourceResolve':
@@ -391,6 +393,57 @@ export class GatewayServer {
     } catch (error) {
       throw resourceError(error, uri);
     }
+  }
+
+  private async resourceRead(params: Record<string, unknown>): Promise<unknown> {
+    this.requireRoot(params);
+    const uri = requireString(params.uri, 'uri');
+    const requestedEncoding = params.encoding;
+    if (
+      requestedEncoding !== undefined
+      && requestedEncoding !== 'utf-8'
+      && requestedEncoding !== 'base64'
+    ) {
+      throw new RpcError(-32602, 'encoding must be utf-8 or base64');
+    }
+    const path = resourcePath(uri);
+    try {
+      const canonicalPath = await realpath(path);
+      const metadata = await stat(canonicalPath);
+      if (!metadata.isFile()) throw new RpcError(-32008, `Not a file: ${uri}`);
+      if (!await this.resourceReadAllowed(canonicalPath)) {
+        throw new RpcError(-32009, `Permission denied: ${uri}`);
+      }
+      if (metadata.size > 16 * 1024 * 1024) {
+        throw new RpcError(-32602, `Resource exceeds the 16 MiB read limit: ${uri}`);
+      }
+      const buffer = await readFile(canonicalPath);
+      const encoding = requestedEncoding ?? (isUtf8(buffer) ? 'utf-8' : 'base64');
+      return {
+        data: encoding === 'utf-8' ? buffer.toString('utf8') : buffer.toString('base64'),
+        encoding,
+        contentType: contentType(canonicalPath),
+      };
+    } catch (error) {
+      throw resourceError(error, uri);
+    }
+  }
+
+  private async resourceReadAllowed(canonicalPath: string): Promise<boolean> {
+    const roots = new Set<string>([process.cwd()]);
+    for (const session of this.store.listSessions(10_000, 0)) {
+      for (const uri of session.state.workingDirectories ?? []) {
+        roots.add(resourcePath(uri));
+      }
+    }
+    for (const root of roots) {
+      try {
+        if (isPathWithin(await realpath(root), canonicalPath)) return true;
+      } catch {
+        continue;
+      }
+    }
+    return false;
   }
 
   private async resourceResolve(params: Record<string, unknown>): Promise<unknown> {
@@ -1259,6 +1312,52 @@ function resourceError(error: unknown, uri: string): RpcError {
     return new RpcError(-32009, `Permission denied: ${uri}`);
   }
   return new RpcError(-32008, `Resource not found: ${uri}`);
+}
+
+function isPathWithin(root: string, candidate: string): boolean {
+  const path = relative(root, candidate);
+  return path === '' || (!path.startsWith('..') && !isAbsolute(path));
+}
+
+function isUtf8(buffer: Buffer): boolean {
+  try {
+    new TextDecoder('utf-8', { fatal: true }).decode(buffer);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function contentType(path: string): string {
+  switch (extname(path).toLowerCase()) {
+    case '.css':
+      return 'text/css';
+    case '.htm':
+    case '.html':
+      return 'text/html';
+    case '.js':
+    case '.cjs':
+    case '.mjs':
+      return 'text/javascript';
+    case '.json':
+      return 'application/json';
+    case '.md':
+    case '.markdown':
+      return 'text/markdown';
+    case '.svg':
+      return 'image/svg+xml';
+    case '.png':
+      return 'image/png';
+    case '.jpg':
+    case '.jpeg':
+      return 'image/jpeg';
+    case '.gif':
+      return 'image/gif';
+    case '.webp':
+      return 'image/webp';
+    default:
+      return 'text/plain';
+  }
 }
 
 function validateToolConfirmation(state: ChatState, action: any): string | undefined {

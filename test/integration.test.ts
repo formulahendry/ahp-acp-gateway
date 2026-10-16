@@ -8,6 +8,7 @@ import WebSocket from 'ws';
 import {
   ActionType,
   CompletionItemKind,
+  ContentEncoding,
   MessageKind,
   PROTOCOL_VERSION,
   SessionStatus,
@@ -271,7 +272,9 @@ test('VS Code remote folder browsing and session config resolution surfaces are 
   t.after(fixture.close);
   const workspace = join(fixture.directory, 'workspace');
   await mkdir(workspace);
-  await writeFile(join(fixture.directory, 'readme.txt'), 'test');
+  await writeFile(join(fixture.directory, 'outside.txt'), 'outside');
+  await writeFile(join(workspace, 'qsort.js'), 'export const qsort = (items) => [...items].sort();\n');
+  await writeFile(join(workspace, 'binary.dat'), Buffer.from([0, 255, 1, 254]));
   const client = new AhpClient(await WebSocketTransport.connect(fixture.url));
   client.connect();
   t.after(() => client.shutdown());
@@ -291,8 +294,8 @@ test('VS Code remote folder browsing and session config resolution surfaces are 
     { name: 'workspace', type: 'directory' },
   );
   assert.deepEqual(
-    listed.entries.find((entry) => entry.name === 'readme.txt'),
-    { name: 'readme.txt', type: 'file' },
+    listed.entries.find((entry) => entry.name === 'outside.txt'),
+    { name: 'outside.txt', type: 'file' },
   );
   const resolved = await client.request('resourceResolve', {
     channel: 'ahp-root://',
@@ -308,6 +311,41 @@ test('VS Code remote folder browsing and session config resolution surfaces are 
     schema: { type: 'object', properties: {} },
     values: {},
   });
+  const session = `ahp-session:/resource-read-${crypto.randomUUID()}`;
+  await client.request('createSession', {
+    channel: session,
+    provider: 'fake',
+    workingDirectories: [pathToFileURL(workspace).href],
+  });
+  const textUri = pathToFileURL(join(workspace, 'qsort.js')).href;
+  const text = await client.request('resourceRead', {
+    channel: 'ahp-root://',
+    uri: process.platform === 'win32'
+      ? textUri.replace(/^file:\/\/\/([A-Za-z]):/, (_, drive: string) =>
+          `file:///${drive.toLowerCase()}%3A`)
+      : textUri,
+  });
+  assert.deepEqual(text, {
+    data: 'export const qsort = (items) => [...items].sort();\n',
+    encoding: 'utf-8',
+    contentType: 'text/javascript',
+  });
+  const binary = await client.request('resourceRead', {
+    channel: 'ahp-root://',
+    uri: pathToFileURL(join(workspace, 'binary.dat')).href,
+  });
+  assert.deepEqual(binary, {
+    data: Buffer.from([0, 255, 1, 254]).toString('base64'),
+    encoding: 'base64',
+    contentType: 'text/plain',
+  });
+  await assert.rejects(
+    client.request('resourceRead', {
+      channel: 'ahp-root://',
+      uri: pathToFileURL(join(fixture.directory, 'outside.txt')).href,
+    }),
+    /Permission denied/,
+  );
 });
 
 test('client-chosen non-ahp session URI schemes are supported', async (t) => {
@@ -745,8 +783,18 @@ test('invalid actions and unsupported methods fail explicitly', async (t) => {
   } as StateAction);
   const rejected = await nextAction(subscription, (item) => item.rejectionReason !== undefined);
   assert.match(rejected.rejectionReason ?? '', /server-only/);
+  const missingUri = pathToFileURL(join(fixture.directory, 'missing.txt')).href;
   await assert.rejects(
-    client.request('resourceRead', { channel: 'ahp-root://', uri: 'file:///nope' }),
+    client.request('resourceRead', { channel: 'ahp-root://', uri: missingUri }),
+    /Resource not found/,
+  );
+  await assert.rejects(
+    client.request('resourceWrite', {
+      channel: 'ahp-root://',
+      uri: missingUri,
+      data: '',
+      encoding: ContentEncoding.Utf8,
+    }),
     /Method not implemented/,
   );
 });

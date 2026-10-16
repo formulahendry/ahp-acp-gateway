@@ -11,6 +11,7 @@ Initial public MVP release.
 - Native AHP provider, model, and Session Config Option integration
 - SQLite persistence, sequencing, replay, reconnect, and restart repair
 - Streaming responses, reasoning, plans, tools, permissions, and cancellation
-- VS Code Agent Window folder and basic terminal compatibility
+- VS Code Agent Window folder browsing, file opening, and basic terminal
+  compatibility
 - Cross-platform lazy provider startup, including Windows `npx.cmd` handling
 - Security controls for remote listeners, Origins, authentication, and stderr

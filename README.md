@@ -55,7 +55,7 @@ ahp-acp-gateway
 - Bounded reconnect replay with snapshot fallback
 - Restart repair for interrupted turns
 - ACP `session/load` after restart when supported
-- Read-only remote folder discovery for AHP clients
+- Read-only remote folder discovery and file opening for AHP clients
 - Basic pipe-backed Agent Host terminal lifecycle
 - ACP commands exposed as AHP slash completions
 - Explicit errors for unsupported protocol methods
@@ -178,7 +178,8 @@ AHP-ACP Gateway is a protocol bridge, not a sandbox.
 
 - ACP v1 only.
 - One public chat per session; `createChat` is not implemented.
-- Folder discovery is read-only.
+- Resource access is read-only: folder listing, metadata resolution, and file
+  reads are implemented; writes, copies, moves, deletes, and watches are not.
 - Terminals are pipe-backed rather than true PTYs; resize propagation and
   command detection are not implemented.
 - No changesets, MCP forwarding, attachments/images, forks, multi-user policy,
