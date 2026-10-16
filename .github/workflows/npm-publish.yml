@@ -1,0 +1,120 @@
+# Publish the npm package on GitHub Release,
+# plus per-push prereleases from main.
+#
+# Uses npm trusted publishing (OIDC) via `--provenance`, so no NPM_TOKEN is
+# required in the repo secrets. The maintainer must register this workflow
+# as a trusted publisher on npmjs.com once:
+#   https://www.npmjs.com/package/ahp-acp-gateway/access -> Publishing access
+#     -> "Trusted Publisher" -> GitHub Actions
+#     repo: formulahendry/ahp-acp-gateway
+#     workflow: npm-publish.yml
+#     environment: (leave blank)
+#
+# Two jobs share the same workflow filename (and therefore the same trusted
+# publisher entry):
+#   - publish-release: on GitHub Release `created`, publishes to dist-tag `latest`
+#   - publish-next:    on push to `main`, publishes a
+#                      `<version>-next.<timestamp>.<sha>` prerelease to `next`
+#
+# Users install:
+#   stable:  npx ahp-acp-gateway@latest
+#   preview: npx ahp-acp-gateway@next
+
+name: publish-npm
+
+on:
+  release:
+    types: [created]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: npm-publish-${{ github.event_name == 'release' && github.event.release.tag_name || 'next' }}
+  cancel-in-progress: false
+
+jobs:
+  publish-release:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # Node 24 ships npm 11.x with OIDC trusted publishing support.
+          node-version: 24
+          registry-url: https://registry.npmjs.org/
+      - name: Verify package.json version matches release tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          pkg_version="$(node -p "require('./package.json').version")"
+          tag_version="${RELEASE_TAG#v}"
+          if [ "$pkg_version" != "$tag_version" ]; then
+            echo "::error::Release tag '$RELEASE_TAG' does not match package.json version '$pkg_version'."
+            echo "Bump package.json to $tag_version (or retag) and re-run."
+            exit 1
+          fi
+      - run: npm ci
+      - run: npm test
+      - run: npm publish --provenance --access public
+
+  publish-next:
+    # Runs on every push to main and on manual dispatch. Publishes a
+    # prerelease versioned as `<package.json version>-next.<UTC timestamp>.<sha>`
+    # to the `next` dist-tag. Never touches `latest` or commits version changes.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org/
+      - name: Compute prerelease version
+        id: version
+        run: |
+          base="$(node -p "require('./package.json').version")"
+          base="${base%%-*}"
+          latest="$(npm view ahp-acp-gateway version 2>/dev/null || echo '')"
+          if [ -n "$latest" ] && [ "$base" = "$latest" ]; then
+            IFS='.' read -r major minor patch <<< "$base"
+            base="${major}.${minor}.$((patch + 1))"
+            echo "Base version ${latest} already published; bumped to ${base}"
+          fi
+          stamp="$(date -u +%Y%m%d%H%M)"
+          sha="$(git rev-parse --short=7 HEAD)"
+          version="${base}-next.${stamp}.${sha}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Computed prerelease version: ${version}"
+      - name: Check if version already published
+        id: check
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if npm view "ahp-acp-gateway@${VERSION}" version >/dev/null 2>&1; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::ahp-acp-gateway@${VERSION} already published, skipping."
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+      - run: npm ci
+        if: steps.check.outputs.already != 'true'
+      - run: npm run build
+        if: steps.check.outputs.already != 'true'
+      - run: npm test
+        if: steps.check.outputs.already != 'true'
+      - name: Set prerelease version in package.json (no commit)
+        if: steps.check.outputs.already != 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: npm version "${VERSION}" --no-git-tag-version --allow-same-version
+      - name: Publish to npm under `next` dist-tag
+        if: steps.check.outputs.already != 'true'
+        run: npm publish --tag next --provenance --access public
