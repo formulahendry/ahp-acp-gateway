@@ -9,7 +9,15 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    name: check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -18,4 +26,5 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
-      - run: npm pack --dry-run
+      - if: runner.os == 'Linux'
+        run: npm pack --dry-run

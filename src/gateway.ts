@@ -26,6 +26,7 @@ import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import type { GatewayConfig, ProviderConfig } from './config.js';
 import {
   AcpV1AdapterFactory,
+  terminateProcessTree,
   toNativeWorkingDirectory,
   type AcpAdapter,
   type AcpAdapterFactory,
@@ -151,7 +152,9 @@ export class GatewayServer {
       });
     });
     for (const connection of this.connections) connection.socket.close(1001, 'Server shutting down');
-    for (const terminal of this.terminals.values()) terminal.kill();
+    await Promise.allSettled(
+      [...this.terminals.values()].map((terminal) => stopTerminalProcess(terminal)),
+    );
     this.terminals.clear();
     await Promise.allSettled([...this.adapters.values()].map((adapter) => adapter.stop()));
     this.adapters.clear();
@@ -521,6 +524,7 @@ export class GatewayServer {
       env: { ...process.env, TERM: 'xterm-256color' },
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
+      detached: process.platform !== 'win32',
     });
     const lifecycle = { status: TerminalLifecycleStatus.Running };
     const state = {
@@ -551,14 +555,14 @@ export class GatewayServer {
     return null;
   }
 
-  private disposeTerminal(params: Record<string, unknown>): null {
+  private async disposeTerminal(params: Record<string, unknown>): Promise<null> {
     const channel = requireTerminalUri(params.channel);
     if (!this.store.getChannel(channel)) throw new RpcError(-32001, `Unknown terminal ${channel}`);
     const child = this.terminals.get(channel);
     this.terminals.delete(channel);
-    child?.kill();
     const rootEnvelope = this.store.deleteTerminal(channel);
     this.broadcastAction(rootEnvelope);
+    if (child) await stopTerminalProcess(child);
     return null;
   }
 
@@ -1358,6 +1362,36 @@ function contentType(path: string): string {
     default:
       return 'text/plain';
   }
+}
+
+async function stopTerminalProcess(child: ChildProcessWithoutNullStreams): Promise<void> {
+  child.stdin.end();
+  if (!childHasExited(child)) {
+    terminateProcessTree(child, false);
+    await waitForChildExit(child, 250);
+  }
+  if (!childHasExited(child)) {
+    terminateProcessTree(child, true);
+    await waitForChildExit(child, 1_000);
+  }
+  child.stdin.destroy();
+  child.stdout.destroy();
+  child.stderr.destroy();
+}
+
+function childHasExited(child: ChildProcessWithoutNullStreams): boolean {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+async function waitForChildExit(
+  child: ChildProcessWithoutNullStreams,
+  timeoutMs: number,
+): Promise<void> {
+  if (childHasExited(child)) return;
+  await Promise.race([
+    new Promise<void>((resolveExit) => child.once('exit', () => resolveExit())),
+    delay(timeoutMs),
+  ]);
 }
 
 function validateToolConfirmation(state: ChatState, action: any): string | undefined {

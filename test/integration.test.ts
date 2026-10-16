@@ -386,6 +386,8 @@ test('VS Code agent-host terminal lifecycle supports create, input, output, and 
     rows: 24,
   });
   const subscription = (await client.subscribe(channel)).subscription;
+  const terminalProcess = fixture.server.terminals.get(channel);
+  assert.ok(terminalProcess);
   const marker = `TERMINAL_${crypto.randomUUID().replaceAll('-', '')}`;
   client.dispatch(channel, {
     type: ActionType.TerminalInput,
@@ -396,6 +398,10 @@ test('VS Code agent-host terminal lifecycle supports create, input, output, and 
   assert.equal(output.action.type, ActionType.TerminalData);
   await client.request('disposeTerminal', { channel });
   assert.equal(fixture.server.store.getChannel(channel), undefined);
+  assert.ok(terminalProcess.exitCode !== null || terminalProcess.signalCode !== null);
+  assert.equal(terminalProcess.stdin.destroyed, true);
+  assert.equal(terminalProcess.stdout.destroyed, true);
+  assert.equal(terminalProcess.stderr.destroyed, true);
 });
 
 test('cancellation and process crash become explicit terminal states', async (t) => {

@@ -824,7 +824,7 @@ export function createSetConfigOptionRequest(
       };
 }
 
-function terminateProcessTree(child: ChildProcessWithoutNullStreams, force: boolean): void {
+export function terminateProcessTree(child: ChildProcessWithoutNullStreams, force: boolean): void {
   if (!child.pid) return;
   if (process.platform === 'win32') {
     const killer = spawn('taskkill', ['/pid', String(child.pid), '/t', ...(force ? ['/f'] : [])], {
