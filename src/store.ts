@@ -54,6 +54,11 @@ export interface AcpBinding {
   loadSupported?: boolean;
   contextReset?: boolean;
   configOptionTypes?: Record<string, 'select' | 'boolean'>;
+  promptCapabilities?: {
+    image?: boolean;
+    audio?: boolean;
+    embeddedContext?: boolean;
+  };
 }
 
 export interface StoredFileEditSnapshot {

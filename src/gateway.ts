@@ -6,6 +6,7 @@ import { createServer, type IncomingMessage, type Server } from 'node:http';
 import { dirname, extname, isAbsolute, join, relative, resolve as resolvePath } from 'node:path';
 import { promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
+import type * as acp from '@agentclientprotocol/sdk';
 import {
   ActionType,
   ChangesetOperationScope,
@@ -13,6 +14,7 @@ import {
   ChangesetStatus,
   ChatOriginKind,
   ConfirmationOptionKind,
+  MessageAttachmentKind,
   MessageKind,
   ResourceChangeType,
   SUPPORTED_PROTOCOL_VERSIONS,
@@ -24,15 +26,19 @@ import {
   ToolCallStatus,
   negotiateProtocolVersion,
   type ActionEnvelope,
+  type AnnotationsState,
   type Changeset,
   type ChangesetFile,
   type ChangesetOperation,
   type ChangesetState,
   type ChangesSummary,
   type ChatState,
+  type Message,
+  type MessageAttachment,
   type ResourceWatchState,
   type SessionState,
   type StateAction,
+  type TextSelection,
 } from '@microsoft/agent-host-protocol';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import type { GatewayConfig, ProviderConfig } from './config.js';
@@ -1807,7 +1813,10 @@ export class GatewayServer {
       }
       const currentChat = this.store.getChat(chatResource);
       if (!currentChat?.state.activeTurn || currentChat.state.activeTurn.id !== action.turnId) return;
-      await adapter.prompt(action.turnId, action.message.text);
+      const promptBlocks = await this.buildPromptContentBlocks(action.message as Message);
+      const stillActive = this.store.getChat(chatResource);
+      if (!stillActive?.state.activeTurn || stillActive.state.activeTurn.id !== action.turnId) return;
+      await adapter.prompt(action.turnId, promptBlocks);
     } catch (error) {
       const chat = this.store.getChat(chatResource);
       if (!chat?.state.activeTurn || chat.state.activeTurn.id !== action.turnId) return;
@@ -1826,6 +1835,254 @@ export class GatewayServer {
       } as StateAction);
       this.broadcastAction(envelope);
       this.syncChatSummary(chat.session, chatResource);
+    }
+  }
+
+  private async buildPromptContentBlocks(message: Message): Promise<acp.ContentBlock[]> {
+    const blocks: acp.ContentBlock[] = [];
+    const attachments = Array.isArray(message.attachments) ? message.attachments : [];
+    for (const attachment of attachments) {
+      const converted = await this.convertAttachmentToContentBlock(attachment);
+      if (converted) blocks.push(converted);
+    }
+    if (message.text.length > 0 || blocks.length === 0) {
+      blocks.push({ type: 'text', text: message.text });
+    }
+    return blocks;
+  }
+
+  private async convertAttachmentToContentBlock(
+    attachment: MessageAttachment,
+  ): Promise<acp.ContentBlock | undefined> {
+    if (!attachment || typeof attachment !== 'object') return undefined;
+    const label = typeof attachment.label === 'string' && attachment.label.length > 0
+      ? attachment.label
+      : 'attachment';
+
+    switch (attachment.type) {
+      case MessageAttachmentKind.Simple: {
+        const text = typeof attachment.modelRepresentation === 'string' && attachment.modelRepresentation.length > 0
+          ? attachment.modelRepresentation
+          : undefined;
+        if (!text) return undefined;
+        return {
+          type: 'text',
+          text: `<attachment label="${escapeXmlAttr(label)}">\n${text}\n</attachment>`,
+        };
+      }
+      case MessageAttachmentKind.EmbeddedResource: {
+        if (typeof attachment.data !== 'string' || typeof attachment.contentType !== 'string') {
+          return undefined;
+        }
+        const mimeType = attachment.contentType;
+        if (mimeType.startsWith('image/')) {
+          return {
+            type: 'image',
+            data: attachment.data,
+            mimeType,
+          };
+        }
+        if (mimeType.startsWith('audio/')) {
+          return {
+            type: 'audio',
+            data: attachment.data,
+            mimeType,
+          };
+        }
+        const buffer = Buffer.from(attachment.data, 'base64');
+        const safeUri = `attachment:///${encodeURIComponent(label)}`;
+        if (isTextualMimeType(mimeType) || isUtf8(buffer)) {
+          const decodedText = sliceTextBySelection(buffer.toString('utf8'), attachment.selection);
+          return {
+            type: 'resource',
+            resource: {
+              uri: safeUri,
+              mimeType,
+              text: decodedText,
+            },
+          };
+        }
+        return {
+          type: 'resource',
+          resource: {
+            uri: safeUri,
+            mimeType,
+            blob: attachment.data,
+          },
+        };
+      }
+      case MessageAttachmentKind.Resource: {
+        if (typeof attachment.uri !== 'string' || attachment.uri.length === 0) {
+          return undefined;
+        }
+        const unwrappedUri = unwrapAgentHostUri(attachment.uri);
+        if (unwrappedUri.startsWith('file:')) {
+          try {
+            const path = resourcePath(unwrappedUri);
+            const canonicalPath = await realpath(path);
+            const metadata = await stat(canonicalPath);
+            if (!await this.resourceReadAllowed(canonicalPath)) {
+              return undefined;
+            }
+            const fileUri = pathToFileURL(canonicalPath).href;
+            if (metadata.isDirectory()) {
+              return {
+                type: 'resource_link',
+                uri: fileUri,
+                name: label,
+                title: label,
+              };
+            }
+            if (!metadata.isFile()) return undefined;
+            const detectedMime = attachment.contentType ?? contentType(canonicalPath);
+            if (metadata.size <= 2 * 1024 * 1024) {
+              const buffer = await readFile(canonicalPath);
+              if (detectedMime.startsWith('image/')) {
+                return {
+                  type: 'image',
+                  data: buffer.toString('base64'),
+                  mimeType: detectedMime,
+                  uri: fileUri,
+                };
+              }
+              if (detectedMime.startsWith('audio/')) {
+                return {
+                  type: 'audio',
+                  data: buffer.toString('base64'),
+                  mimeType: detectedMime,
+                };
+              }
+              if (isTextualMimeType(detectedMime) || isUtf8(buffer)) {
+                const rawText = buffer.toString('utf8');
+                const selectedText = sliceTextBySelection(rawText, attachment.selection);
+                const selectionFragment = formatSelectionFragment(attachment.selection);
+                return {
+                  type: 'resource',
+                  resource: {
+                    uri: `${fileUri}${selectionFragment}`,
+                    mimeType: detectedMime,
+                    text: selectedText,
+                  },
+                };
+              }
+            }
+            const selectionFragment = formatSelectionFragment(attachment.selection);
+            return {
+              type: 'resource_link',
+              uri: `${fileUri}${selectionFragment}`,
+              name: label,
+              title: label,
+              mimeType: detectedMime,
+              size: metadata.size,
+            };
+          } catch {
+            return undefined;
+          }
+        }
+        if (unwrappedUri.startsWith('git-blob:') || unwrappedUri.startsWith('session-db:')) {
+          try {
+            const readRes = unwrappedUri.startsWith('git-blob:')
+              ? await this.readGitBlobResource(unwrappedUri, 'utf-8')
+              : await this.readSessionDbResource(unwrappedUri, 'utf-8');
+            return {
+              type: 'resource',
+              resource: {
+                uri: unwrappedUri,
+                mimeType: readRes.contentType,
+                text: sliceTextBySelection(readRes.data, attachment.selection),
+              },
+            };
+          } catch {
+            return undefined;
+          }
+        }
+        return {
+          type: 'resource_link',
+          uri: unwrappedUri,
+          name: label,
+          title: label,
+          ...(attachment.contentType ? { mimeType: attachment.contentType } : {}),
+        };
+      }
+      case MessageAttachmentKind.Annotations: {
+        if (typeof attachment.resource !== 'string') return undefined;
+        const annotationsState = this.store.getChannel(attachment.resource) as AnnotationsState | undefined;
+        const allAnnotations = annotationsState?.annotations ?? [];
+        const filterIds = Array.isArray(attachment.annotationIds)
+          ? new Set(attachment.annotationIds)
+          : undefined;
+        const matched = filterIds
+          ? allAnnotations.filter((item) => filterIds.has(item.id))
+          : allAnnotations;
+        if (matched.length > 0) {
+          const lines = matched.map((item) => {
+            const loc = item.range
+              ? `${item.resource}#L${item.range.start.line + 1}-L${item.range.end.line + 1}`
+              : item.resource;
+            const entryTexts = (item.entries ?? []).map((entry) =>
+              typeof entry.text === 'string' ? entry.text : entry.text.markdown).join(' / ');
+            return `- [${loc}] ${entryTexts}`;
+          });
+          return {
+            type: 'text',
+            text: `<annotations label="${escapeXmlAttr(label)}">\n${lines.join('\n')}\n</annotations>`,
+          };
+        }
+        const metaObj = attachment._meta;
+        if (metaObj && typeof metaObj === 'object') {
+          for (const val of Object.values(metaObj)) {
+            if (val && typeof val === 'object' && Array.isArray((val as any).feedbackItems)) {
+              const items = (val as any).feedbackItems as Array<{
+                resourceUri?: string;
+                text?: string;
+                range?: { start?: { line?: number }; end?: { line?: number } };
+              }>;
+              const lines = items
+                .filter((it) => typeof it.text === 'string' && it.text.length > 0)
+                .map((it) => {
+                  const loc = it.resourceUri
+                    ? (typeof it.range?.start?.line === 'number' && typeof it.range?.end?.line === 'number'
+                        ? `${it.resourceUri}#L${it.range.start.line + 1}-L${it.range.end.line + 1}`
+                        : it.resourceUri)
+                    : label;
+                  return `- [${loc}] ${it.text}`;
+                });
+              if (lines.length > 0) {
+                return {
+                  type: 'text',
+                  text: `<annotations label="${escapeXmlAttr(label)}">\n${lines.join('\n')}\n</annotations>`,
+                };
+              }
+            }
+          }
+        }
+        return undefined;
+      }
+      case MessageAttachmentKind.Chat: {
+        if (typeof attachment.resource !== 'string') return undefined;
+        const refChat = this.store.getChat(attachment.resource);
+        if (!refChat || refChat.state.turns.length === 0) return undefined;
+        const turns = refChat.state.turns;
+        let endIndex = turns.length - 1;
+        if (typeof attachment.endTurn === 'string') {
+          const foundIdx = turns.findIndex((turn) => turn.id === attachment.endTurn);
+          if (foundIdx >= 0) endIndex = foundIdx;
+        }
+        const slice = turns.slice(0, endIndex + 1);
+        const transcript = slice.map((turn) => {
+          const assistantText = turn.responseParts
+            .flatMap((part) => part.kind === 'markdown' ? [part.content] : [])
+            .join('');
+          return `User: ${turn.message.text}\nAssistant: ${assistantText}`;
+        }).join('\n\n');
+        if (!transcript) return undefined;
+        return {
+          type: 'text',
+          text: `<chat_transcript label="${escapeXmlAttr(label)}" resource="${escapeXmlAttr(attachment.resource)}">\n${transcript}\n</chat_transcript>`,
+        };
+      }
+      default:
+        return undefined;
     }
   }
 
@@ -2168,6 +2425,84 @@ function isUtf8(buffer: Buffer): boolean {
   } catch {
     return false;
   }
+}
+
+function isTextualMimeType(mimeType: string): boolean {
+  const normalized = mimeType.toLowerCase().split(';')[0]?.trim() ?? '';
+  return normalized.startsWith('text/')
+    || normalized === 'application/json'
+    || normalized === 'application/javascript'
+    || normalized === 'application/typescript'
+    || normalized === 'application/xml'
+    || normalized === 'application/x-sh'
+    || normalized.endsWith('+json')
+    || normalized.endsWith('+xml');
+}
+
+function escapeXmlAttr(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function formatSelectionFragment(selection: TextSelection | undefined): string {
+  return formatSelectionRangeFragment(selection);
+}
+
+export function formatSelectionRangeFragment(selection: TextSelection | undefined): string {
+  const range = selection?.range;
+  if (
+    !range
+    || typeof range.start?.line !== 'number'
+    || typeof range.end?.line !== 'number'
+  ) {
+    return '';
+  }
+  const startLine = Math.max(1, range.start.line + 1);
+  const endLine = Math.max(startLine, range.end.line + 1);
+  return startLine === endLine ? `#L${startLine}` : `#L${startLine}-L${endLine}`;
+}
+
+export function sliceTextBySelection(text: string, selection: TextSelection | undefined): string {
+  const range = selection?.range;
+  if (
+    !range
+    || typeof range.start?.line !== 'number'
+    || typeof range.start?.character !== 'number'
+    || typeof range.end?.line !== 'number'
+    || typeof range.end?.character !== 'number'
+  ) {
+    return text;
+  }
+  const lines = text.split(/\r?\n/);
+  const startLine = Math.max(0, Math.min(lines.length - 1, range.start.line));
+  const endLine = Math.max(startLine, Math.min(lines.length - 1, range.end.line));
+  if (lines.length === 0) return text;
+  if (startLine === endLine) {
+    const line = lines[startLine] ?? '';
+    const startChar = Math.max(0, Math.min(line.length, range.start.character));
+    const endChar = range.end.character > startChar
+      ? Math.min(line.length, range.end.character)
+      : line.length;
+    return line.slice(startChar, endChar);
+  }
+  const selected: string[] = [];
+  for (let idx = startLine; idx <= endLine; idx++) {
+    const line = lines[idx] ?? '';
+    if (idx === startLine) {
+      selected.push(line.slice(Math.max(0, Math.min(line.length, range.start.character))));
+    } else if (idx === endLine) {
+      const endChar = range.end.character > 0
+        ? Math.min(line.length, range.end.character)
+        : line.length;
+      selected.push(line.slice(0, endChar));
+    } else {
+      selected.push(line);
+    }
+  }
+  return selected.join('\n');
 }
 
 function contentType(path: string): string {

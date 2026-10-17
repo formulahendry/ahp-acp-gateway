@@ -110,6 +110,13 @@ approval option itself. It validates the active turn, pending tool state,
 selected option, approval/denial semantics, and ACP pending request before
 persisting the confirmation.
 
+Incoming AHP `Message.attachments` (`resource`, `embeddedResource`, `simple`,
+`annotations`, and `chat`) are translated into ACP `session/prompt`
+`ContentBlock[]` items (`resource`, `resource_link`, `image`, `audio`, and
+`text`) and adapted to the ACP agent's advertised `promptCapabilities` (`image`,
+`audio`, `embeddedContext`), while enforcing working-directory path boundaries on
+`file:` references.
+
 Cancellation is different from other ACP side effects: the AHP cancellation is
 sequenced and broadcast first. Pending permission requests are then closed
 synchronously, and ACP cancellation is bounded. An agent that does not settle

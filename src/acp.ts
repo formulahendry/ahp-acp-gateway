@@ -38,7 +38,7 @@ export interface AcpAdapterCallbacks {
 export interface AcpAdapter {
   readonly binding: AcpBinding;
   start(): Promise<void>;
-  prompt(turnId: string, text: string): Promise<void>;
+  prompt(turnId: string, prompt: string | acp.ContentBlock[]): Promise<void>;
   cancel(): Promise<boolean>;
   validatePermission(
     turnId: string,
@@ -205,6 +205,16 @@ class AcpV1Process implements AcpAdapter {
           },
         });
         const loadSupported = initialized.agentCapabilities?.loadSession === true;
+        const promptCaps = initialized.agentCapabilities?.promptCapabilities;
+        const promptCapabilities = promptCaps
+          ? {
+              ...(typeof promptCaps.image === 'boolean' ? { image: promptCaps.image } : {}),
+              ...(typeof promptCaps.audio === 'boolean' ? { audio: promptCaps.audio } : {}),
+              ...(typeof promptCaps.embeddedContext === 'boolean'
+                ? { embeddedContext: promptCaps.embeddedContext }
+                : {}),
+            }
+          : undefined;
         let sessionId = this.binding.acpSessionId;
         let contextReset = false;
 
@@ -233,6 +243,7 @@ class AcpV1Process implements AcpAdapter {
           loadSupported,
           contextReset,
           configOptionTypes: Object.fromEntries(this.configOptionTypes),
+          ...(promptCapabilities ? { promptCapabilities } : {}),
         });
         this.callbacks.bindingChanged({ ...this.binding });
         this.ready = true;
@@ -252,7 +263,7 @@ class AcpV1Process implements AcpAdapter {
     }
   }
 
-  async prompt(turnId: string, text: string): Promise<void> {
+  async prompt(turnId: string, promptInput: string | acp.ContentBlock[]): Promise<void> {
     const startedAt = Date.now();
     let requestStarted = false;
     this.cancelRequested = false;
@@ -267,10 +278,16 @@ class AcpV1Process implements AcpAdapter {
         this.resolvePromptSettled = resolve;
       });
       requestStarted = true;
+      const rawBlocks: acp.ContentBlock[] = typeof promptInput === 'string'
+        ? [{ type: 'text', text: promptInput }]
+        : promptInput.length > 0
+          ? promptInput
+          : [{ type: 'text', text: '' }];
+      const prompt = adaptPromptBlocksToCapabilities(rawBlocks, this.binding.promptCapabilities);
       const result = await withTimeout(
         this.context.request(acp.methods.agent.session.prompt, {
           sessionId: this.binding.acpSessionId,
-          prompt: [{ type: 'text', text }],
+          prompt,
         }),
         this.provider.requestTimeoutMs,
         'ACP prompt',
@@ -1209,4 +1226,56 @@ export function computeLineDiffStats(
     removed: Math.max(0, oldMid.length - lcs),
   };
 }
+
+export function adaptPromptBlocksToCapabilities(
+  blocks: acp.ContentBlock[],
+  capabilities: { image?: boolean; audio?: boolean; embeddedContext?: boolean } | undefined,
+): acp.ContentBlock[] {
+  const adapted = blocks.map((block): acp.ContentBlock => {
+    if (block.type === 'image' && !capabilities?.image) {
+      return {
+        type: 'text',
+        text: `[Attached image (${block.mimeType})${block.uri ? `: ${block.uri}` : ''}]`,
+      };
+    }
+    if (block.type === 'audio' && !capabilities?.audio) {
+      return {
+        type: 'text',
+        text: `[Attached audio (${block.mimeType})]`,
+      };
+    }
+    if (block.type === 'resource' && !capabilities?.embeddedContext) {
+      const res = block.resource as { uri: string; text?: string; blob?: string; mimeType?: string | null };
+      if (typeof res.text === 'string') {
+        if (res.uri.startsWith('file:')) {
+          const name = res.uri.split('/').pop() || res.uri;
+          return {
+            type: 'text',
+            text: `<context uri="${res.uri}" name="${name}">\n${res.text}\n</context>`,
+          };
+        }
+        return {
+          type: 'text',
+          text: res.text,
+        };
+      }
+      if (res.uri.startsWith('file:')) {
+        const name = res.uri.split('/').pop() || res.uri;
+        return {
+          type: 'resource_link',
+          uri: res.uri,
+          name,
+          ...(res.mimeType ? { mimeType: res.mimeType } : {}),
+        };
+      }
+      return {
+        type: 'text',
+        text: `[Attached binary resource: ${res.uri}]`,
+      };
+    }
+    return block;
+  });
+  return adapted.length > 0 ? adapted : [{ type: 'text', text: '' }];
+}
+
 

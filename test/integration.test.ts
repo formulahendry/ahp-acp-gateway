@@ -13,6 +13,7 @@ import {
   ChangesetStatus,
   CompletionItemKind,
   ContentEncoding,
+  MessageAttachmentKind,
   MessageKind,
   PROTOCOL_VERSION,
   ResourceChangeType,
@@ -28,9 +29,14 @@ import {
 } from '@microsoft/agent-host-protocol';
 import { AhpClient, type Subscription } from '@microsoft/agent-host-protocol/client';
 import { WebSocketTransport } from '@microsoft/agent-host-protocol/ws';
-import { GatewayServer } from '../src/gateway.js';
+import {
+  formatSelectionRangeFragment,
+  GatewayServer,
+  sliceTextBySelection,
+} from '../src/gateway.js';
 import { GatewayStore } from '../src/store.js';
 import {
+  adaptPromptBlocksToCapabilities,
   createSetConfigOptionRequest,
   requiresCommandShell,
   resolveProviderExecutable,
@@ -1782,6 +1788,252 @@ test('ACP native diff content produces fileEdit tool results, session-db resourc
 
   const finalUncommitted = fixture.server.store.getChannel(uncommittedChannel) as ChangesetState;
   assert.equal(finalUncommitted.files.length, 0);
+});
+
+test('Message attachments (resource file/selection/image, embeddedResource image/text, simple, chat) translate into ACP prompt ContentBlocks and respect path boundaries', async (t) => {
+  const fixture = await startFixture();
+  const workDir = await mkdtemp(join(tmpdir(), 'ahp-acp-attach-work-'));
+  const outsideDir = await mkdtemp(join(tmpdir(), 'ahp-acp-attach-outside-'));
+  const client = await connectClient(fixture.url, 'attach-client');
+  t.after(async () => {
+    await client.shutdown();
+    await fixture.close();
+    await rm(workDir, { recursive: true, force: true });
+    await rm(outsideDir, { recursive: true, force: true });
+  });
+
+  const codeFile = join(workDir, 'sample.ts');
+  await writeFile(codeFile, 'const line1 = 1;\nconst line2 = 2;\nconst line3 = 3;\n', 'utf8');
+  const outsideFile = join(outsideDir, 'secret.txt');
+  await writeFile(outsideFile, 'TOP_SECRET_OUTSIDE_CONTENT\n', 'utf8');
+
+  const session = `ahp-session:/attach-${crypto.randomUUID()}`;
+  const workDirUri = pathToFileURL(workDir).href;
+  await client.request('createSession', {
+    channel: session,
+    provider: 'fake',
+    workingDirectories: [workDirUri],
+  });
+  const sessionState = (await client.subscribe(session)).result.snapshot?.state as SessionState;
+  const chat = sessionState.defaultChat!;
+  const chatSub = (await client.subscribe(chat)).subscription;
+
+  // Run an initial turn so we can also test Chat attachment referencing a prior turn
+  const seedTurnId = crypto.randomUUID();
+  client.dispatch(chat, userTurn(seedTurnId, 'seed message'));
+  await collectUntil(chatSub, ActionType.ChatTurnComplete);
+
+  const canonicalCodeUri = pathToFileURL(await realpath(codeFile)).href;
+  const parsedCodeUrl = new URL(canonicalCodeUri);
+  const ahPayload = Buffer.from(JSON.stringify({ scheme: 'file' }), 'utf8').toString('base64url');
+  const wrappedCodeUri = `vscode-agent-host://hex-3132372e302e302e313a31383039302f616870${parsedCodeUrl.pathname}?_ah=${ahPayload}`;
+
+  const pngBase64 = Buffer.from('fake-png-bytes').toString('base64');
+  const pastedTextBase64 = Buffer.from('pasted snippet line', 'utf8').toString('base64');
+
+  const turnId = crypto.randomUUID();
+  client.dispatch(chat, {
+    type: ActionType.ChatTurnStarted,
+    turnId,
+    startedAt: new Date().toISOString(),
+    message: {
+      text: 'inspect-prompt',
+      origin: { kind: MessageKind.User },
+      attachments: [
+        {
+          type: MessageAttachmentKind.Resource,
+          label: 'sample.ts',
+          displayKind: 'selection',
+          uri: wrappedCodeUri,
+          selection: {
+            range: {
+              start: { line: 1, character: 0 },
+              end: { line: 1, character: 16 },
+            },
+          },
+        },
+        {
+          type: MessageAttachmentKind.Resource,
+          label: 'secret.txt',
+          displayKind: 'document',
+          uri: pathToFileURL(outsideFile).href,
+        },
+        {
+          type: MessageAttachmentKind.EmbeddedResource,
+          label: 'screenshot.png',
+          displayKind: 'image',
+          contentType: 'image/png',
+          data: pngBase64,
+        },
+        {
+          type: MessageAttachmentKind.EmbeddedResource,
+          label: 'unsaved.txt',
+          displayKind: 'document',
+          contentType: 'text/plain',
+          data: pastedTextBase64,
+        },
+        {
+          type: MessageAttachmentKind.Simple,
+          label: 'Workspace context',
+          modelRepresentation: 'Workspace has 1 file.',
+        },
+        {
+          type: MessageAttachmentKind.Chat,
+          label: 'Prior Chat',
+          resource: chat,
+          endTurn: seedTurnId,
+        },
+      ],
+    },
+  } as StateAction);
+
+  await collectUntil(chatSub, ActionType.ChatTurnComplete);
+  const finalChat = (await client.subscribe(chat)).result.snapshot?.state as ChatState;
+  const turn = finalChat.turns.find((item) => item.id === turnId)!;
+  const markdownText = turn.responseParts
+    .flatMap((part) => part.kind === 'markdown' ? [part.content] : [])
+    .join('');
+
+  assert.match(markdownText, /^prompt-blocks:/);
+  const promptBlocks = JSON.parse(markdownText.slice('prompt-blocks:'.length)) as any[];
+
+  // 1. Wrapped file URI inside workspace with selection -> embedded resource with line 2 only and #L2 fragment
+  const codeBlock = promptBlocks.find(
+    (b) => b.type === 'resource' && typeof b.resource?.uri === 'string' && b.resource.uri.endsWith('/sample.ts#L2'),
+  );
+  assert.ok(codeBlock);
+  assert.equal(codeBlock.resource.text, 'const line2 = 2;');
+
+  // 2. Outside file is rejected by path boundary check
+  assert.equal(
+    promptBlocks.some((b) => JSON.stringify(b).includes('TOP_SECRET_OUTSIDE_CONTENT') || JSON.stringify(b).includes('secret.txt')),
+    false,
+  );
+
+  // 3. Embedded image -> ACP image block
+  const imageBlock = promptBlocks.find((b) => b.type === 'image');
+  assert.ok(imageBlock);
+  assert.equal(imageBlock.mimeType, 'image/png');
+  assert.equal(imageBlock.data, pngBase64);
+
+  // 4. Embedded text -> ACP resource block
+  const unsavedBlock = promptBlocks.find(
+    (b) => b.type === 'resource' && b.resource?.uri === 'attachment:///unsaved.txt',
+  );
+  assert.ok(unsavedBlock);
+  assert.equal(unsavedBlock.resource.text, 'pasted snippet line');
+
+  // 5. Simple attachment -> text block
+  const simpleBlock = promptBlocks.find(
+    (b) => b.type === 'text' && typeof b.text === 'string' && b.text.includes('Workspace has 1 file.'),
+  );
+  assert.ok(simpleBlock);
+
+  // 6. Chat attachment -> text block with prior transcript
+  const chatBlock = promptBlocks.find(
+    (b) => b.type === 'text' && typeof b.text === 'string' && b.text.includes('User: seed message'),
+  );
+  assert.ok(chatBlock);
+
+  // 7. User message text is preserved at the end
+  assert.deepEqual(promptBlocks[promptBlocks.length - 1], {
+    type: 'text',
+    text: 'inspect-prompt',
+  });
+
+  // 8. Verify capability fallback when agent does not advertise image/embeddedContext
+  const downgraded = adaptPromptBlocksToCapabilities(promptBlocks, {
+    image: false,
+    audio: false,
+    embeddedContext: false,
+  });
+  assert.equal(downgraded.some((b) => b.type === 'image' || b.type === 'resource'), false);
+  assert.ok(downgraded.some((b) => b.type === 'text' && b.text.includes('const line2 = 2;')));
+  assert.ok(downgraded.some((b) => b.type === 'text' && b.text.includes('[Attached image (image/png)]')));
+});
+
+test('Attachment unit helpers slice text selections and adapt prompt ContentBlocks across capability matrices', () => {
+  const sample = 'alpha-0123\nbeta-4567\ngamma-89';
+
+  assert.equal(sliceTextBySelection(sample, undefined), sample);
+  assert.equal(formatSelectionRangeFragment(undefined), '');
+
+  // Single-line character range
+  assert.equal(
+    sliceTextBySelection(sample, {
+      range: {
+        start: { line: 1, character: 5 },
+        end: { line: 1, character: 9 },
+      },
+    }),
+    '4567',
+  );
+  assert.equal(
+    formatSelectionRangeFragment({
+      range: {
+        start: { line: 1, character: 5 },
+        end: { line: 1, character: 9 },
+      },
+    }),
+    '#L2',
+  );
+
+  // Multi-line selection range
+  assert.equal(
+    sliceTextBySelection(sample, {
+      range: {
+        start: { line: 0, character: 6 },
+        end: { line: 2, character: 5 },
+      },
+    }),
+    '0123\nbeta-4567\ngamma',
+  );
+  assert.equal(
+    formatSelectionRangeFragment({
+      range: {
+        start: { line: 0, character: 6 },
+        end: { line: 2, character: 5 },
+      },
+    }),
+    '#L1-L3',
+  );
+
+  // Capability matrix: empty blocks fallback, audio fallback, and binary resource_link fallback
+  assert.deepEqual(adaptPromptBlocksToCapabilities([], {}), [{ type: 'text', text: '' }]);
+
+  const adapted = adaptPromptBlocksToCapabilities(
+    [
+      { type: 'audio', data: 'AAAA', mimeType: 'audio/wav' },
+      {
+        type: 'resource',
+        resource: {
+          uri: 'file:///workspace/archive.bin',
+          mimeType: 'application/octet-stream',
+          blob: 'AAAA',
+        },
+      },
+      {
+        type: 'resource',
+        resource: {
+          uri: 'attachment:///raw.bin',
+          mimeType: 'application/octet-stream',
+          blob: 'BBBB',
+        },
+      },
+    ],
+    { image: false, audio: false, embeddedContext: false },
+  );
+
+  assert.deepEqual(adapted, [
+    { type: 'text', text: '[Attached audio (audio/wav)]' },
+    {
+      type: 'resource_link',
+      uri: 'file:///workspace/archive.bin',
+      name: 'archive.bin',
+      mimeType: 'application/octet-stream',
+    },
+    { type: 'text', text: '[Attached binary resource: attachment:///raw.bin]' },
+  ]);
 });
 
 function storedSession(resource: string, chat: string, now: string) {

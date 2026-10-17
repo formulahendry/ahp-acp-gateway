@@ -46,6 +46,17 @@ acp.agent({ name: 'ahp-acp-gateway-test-agent' })
     protocolVersion: ctx.params.protocolVersion,
     agentCapabilities: {
       loadSession: !process.argv.includes('--no-load') && process.env.ACP_NO_LOAD !== '1',
+      promptCapabilities: process.argv.includes('--no-prompt-caps')
+        ? {
+            image: false,
+            audio: false,
+            embeddedContext: false,
+          }
+        : {
+            image: true,
+            audio: true,
+            embeddedContext: true,
+          },
     },
     authMethods: [],
   }))
@@ -300,6 +311,20 @@ acp.agent({ name: 'ahp-acp-gateway-test-agent' })
           size: 456,
         },
       });
+    }
+    if (ctx.params.prompt.some((part) => part.type === 'text' && part.text === 'inspect-prompt')) {
+      await ctx.client.notify(acp.methods.client.session.update, {
+        sessionId: ctx.params.sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: {
+            type: 'text',
+            text: `prompt-blocks:${JSON.stringify(ctx.params.prompt)}`,
+          },
+        },
+      });
+      sessions.set(ctx.params.sessionId, undefined);
+      return { stopReason: 'end_turn' };
     }
     await ctx.client.notify(acp.methods.client.session.update, {
       sessionId: ctx.params.sessionId,
