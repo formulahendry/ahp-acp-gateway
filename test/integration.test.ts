@@ -1439,13 +1439,14 @@ test('Changeset channels, git-blob resourceRead, review state, discard-changes, 
       && item.action.changes.items.some((change) =>
         change.uri.endsWith('/added.txt') && change.type === ResourceChangeType.Deleted),
   );
-  await writeFile(untrackedFile, 'new file content\n', 'utf8');
+  const secondUntrackedFile = join(repoDir, 'added2.txt');
+  await writeFile(secondUntrackedFile, 'new file content\n', 'utf8');
   await nextAction(
     watchSubscribed.subscription,
     (item) =>
       item.action.type === ActionType.ResourceWatchChanged
       && item.action.changes.items.some((change) =>
-        change.uri.endsWith('/added.txt') && change.type === ResourceChangeType.Added),
+        change.uri.endsWith('/added2.txt') && change.type === ResourceChangeType.Added),
   );
 
   // 2. Run a turn so changesets refresh automatically
@@ -1507,7 +1508,7 @@ test('Changeset channels, git-blob resourceRead, review state, discard-changes, 
   assert.equal(await readFile(trackedFile, 'utf8'), 'line1\nline2\n');
   const afterDiscard = fixture.server.store.getChannel(uncommittedChannel) as ChangesetState;
   assert.equal(afterDiscard.files.length, 1);
-  assert.ok(afterDiscard.files[0]?.id.endsWith('/added.txt'));
+  assert.ok(afterDiscard.files[0]?.id.endsWith('/added2.txt'));
 
   // 8. Unsubscribe from resourceWatch cleans up the channel
   await client.unsubscribe(watchRes.channel);
