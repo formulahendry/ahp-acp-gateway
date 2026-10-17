@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { promisify } from 'node:util';
@@ -1561,7 +1561,7 @@ test('Changesets and git-blob reads stay inside a subdirectory working root', as
   const changeset = fixture.server.store.getChannel(uncommittedChannel) as ChangesetState;
   assert.deepEqual(
     changeset.files.map((file) => file.id),
-    [pathToFileURL(insideFile).href],
+    [pathToFileURL(await realpath(insideFile)).href],
   );
 
   const outsideBlobUri = `git-blob:/outside/secret.txt?${encodeURIComponent(JSON.stringify({

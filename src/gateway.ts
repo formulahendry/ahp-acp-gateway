@@ -441,7 +441,7 @@ export class GatewayServer {
     if (!snapshot) throw new RpcError(-32001, `Unknown channel ${channel}`);
     connection.subscriptions.add(channel);
     if (this.store.getChannelKind(channel) === 'resourceWatch') {
-      this.ensureResourceWatcherStarted(channel);
+      await this.ensureResourceWatcherStarted(channel);
     }
     return { channel, snapshot };
   }
@@ -1536,12 +1536,17 @@ export class GatewayServer {
     return { channel };
   }
 
-  private ensureResourceWatcherStarted(channel: string): void {
+  private async ensureResourceWatcherStarted(channel: string): Promise<void> {
     if (this.resourceWatchers.has(channel)) return;
     const state = this.store.getChannel(channel) as ResourceWatchState | undefined;
     if (!state) return;
     const rootPath = resourcePath(state.root);
-    const knownExists = new Map<string, boolean>();
+    const knownExists = await collectExistingWatchPaths(
+      rootPath,
+      Boolean(state.recursive),
+      state.excludes?.items,
+      state.includes?.items,
+    );
     let watcher: FSWatcher;
     try {
       watcher = watchFs(rootPath, { recursive: Boolean(state.recursive) }, (eventType, filename) => {
@@ -1583,7 +1588,7 @@ export class GatewayServer {
     if (changes.length === 0) return;
 
     const items: Array<{ uri: string; type: ResourceChangeType }> = [];
-    for (const [fullPath, eventType] of changes) {
+    for (const [fullPath] of changes) {
       const existedBefore = entry.knownExists.get(fullPath);
       let existsNow = false;
       try {
@@ -1595,7 +1600,7 @@ export class GatewayServer {
       entry.knownExists.set(fullPath, existsNow);
       const changeType = !existsNow
         ? ResourceChangeType.Deleted
-        : eventType === 'change' || existedBefore === true
+        : existedBefore === true
           ? ResourceChangeType.Updated
           : ResourceChangeType.Added;
       items.push({
@@ -2492,6 +2497,37 @@ function shouldIgnoreWatchedPath(
     return !includes.some((pattern) => matchesSimpleGlob(relativePath, segments, pattern));
   }
   return false;
+}
+
+async function collectExistingWatchPaths(
+  rootPath: string,
+  recursive: boolean,
+  excludes: readonly string[] | undefined,
+  includes: readonly string[] | undefined,
+): Promise<Map<string, boolean>> {
+  const knownExists = new Map<string, boolean>([[rootPath, true]]);
+  const pending = [{ path: rootPath, relativePath: '' }];
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    let entries;
+    try {
+      entries = await readdir(current.path, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const relativePath = current.relativePath
+        ? `${current.relativePath}/${entry.name}`
+        : entry.name;
+      if (shouldIgnoreWatchedPath(relativePath, excludes, includes)) continue;
+      const fullPath = resolvePath(current.path, entry.name);
+      knownExists.set(fullPath, true);
+      if (recursive && entry.isDirectory()) {
+        pending.push({ path: fullPath, relativePath });
+      }
+    }
+  }
+  return knownExists;
 }
 
 function matchesSimpleGlob(relativePath: string, segments: string[], pattern: string): boolean {
