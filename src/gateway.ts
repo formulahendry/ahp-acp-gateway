@@ -40,6 +40,7 @@ import {
   AcpV1AdapterFactory,
   terminateProcessTree,
   toNativeWorkingDirectory,
+  unwrapAgentHostUri,
   type AcpAdapter,
   type AcpAdapterFactory,
 } from './acp.js';
@@ -498,7 +499,7 @@ export class GatewayServer {
 
   private async resourceRead(params: Record<string, unknown>): Promise<unknown> {
     this.requireRoot(params);
-    const uri = requireString(params.uri, 'uri');
+    const uri = unwrapAgentHostUri(requireString(params.uri, 'uri'));
     const requestedEncoding = params.encoding;
     if (
       requestedEncoding !== undefined
@@ -901,24 +902,28 @@ export class GatewayServer {
           this.broadcastAction(this.store.reject(channel, action, origin, stateError));
           return;
         }
+        const resolvedSelectedOptionId = resolveConfirmationOptionId(chat.state, action);
+        const normalizedAction = resolvedSelectedOptionId && action.selectedOptionId === undefined
+          ? { ...action, selectedOptionId: resolvedSelectedOptionId }
+          : action;
         const adapter = this.getAdapter(channel);
         const adapterError = adapter.validatePermission(
-          action.turnId,
-          action.toolCallId,
-          action.approved,
-          action.selectedOptionId,
+          normalizedAction.turnId,
+          normalizedAction.toolCallId,
+          normalizedAction.approved,
+          normalizedAction.selectedOptionId,
         );
         if (adapterError) {
           this.broadcastAction(this.store.reject(channel, action, origin, adapterError));
           return;
         }
-        const accepted = this.store.apply(channel, action, origin);
+        const accepted = this.store.apply(channel, normalizedAction, origin);
         this.broadcastAction(accepted);
         adapter.resolvePermission(
-          action.turnId,
-          action.toolCallId,
-          action.approved,
-          action.selectedOptionId,
+          normalizedAction.turnId,
+          normalizedAction.toolCallId,
+          normalizedAction.approved,
+          normalizedAction.selectedOptionId,
         );
         return;
       }
@@ -2007,8 +2012,9 @@ function isTerminalChannel(uri: string): boolean {
 
 function requireWorkingDirectoryUri(value: string): string {
   try {
-    toNativeWorkingDirectory(value);
-    return new URL(value).href;
+    const unwrapped = unwrapAgentHostUri(value);
+    toNativeWorkingDirectory(unwrapped);
+    return new URL(unwrapped).href;
   } catch (error) {
     throw new RpcError(-32602, asError(error).message);
   }
@@ -2107,6 +2113,19 @@ async function waitForChildExit(
   ]);
 }
 
+function resolveConfirmationOptionId(state: ChatState, action: any): string | undefined {
+  if (typeof action.selectedOptionId === 'string') return action.selectedOptionId;
+  const turn = state.activeTurn;
+  if (!turn || turn.id !== action.turnId) return undefined;
+  const part = turn.responseParts.find((candidate) =>
+    candidate.kind === 'toolCall' && candidate.toolCall.toolCallId === action.toolCallId);
+  if (!part || part.kind !== 'toolCall' || part.toolCall.status !== ToolCallStatus.PendingConfirmation) {
+    return undefined;
+  }
+  return part.toolCall.options?.find((option) =>
+    (option.kind === ConfirmationOptionKind.Approve) === Boolean(action.approved))?.id;
+}
+
 function validateToolConfirmation(state: ChatState, action: any): string | undefined {
   if (typeof action.approved !== 'boolean') return 'approved must be a boolean';
   const turn = state.activeTurn;
@@ -2118,7 +2137,8 @@ function validateToolConfirmation(state: ChatState, action: any): string | undef
     return 'Tool call is not pending confirmation';
   }
   const selected = action.selectedOptionId === undefined
-    ? undefined
+    ? part.toolCall.options?.find((option) =>
+      (option.kind === ConfirmationOptionKind.Approve) === action.approved)
     : part.toolCall.options?.find((option) => option.id === action.selectedOptionId);
   if (part.toolCall.options?.length && !selected) {
     return action.selectedOptionId

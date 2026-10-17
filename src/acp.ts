@@ -358,10 +358,13 @@ class AcpV1Process implements AcpAdapter {
   ): string | undefined {
     const pending = this.permissions.get(toolCallId);
     if (!pending || pending.turnId !== turnId) return 'Permission request is unknown or no longer pending';
-    if (!selectedOptionId) return 'A selectedOptionId is required for this permission request';
-    const selected = selectedOptionId
-      ? pending.options.find((option) => option.optionId === selectedOptionId)
-      : undefined;
+    if (!selectedOptionId) {
+      const defaultOption = pending.options.find((option) =>
+        approved ? option.kind.startsWith('allow') : !option.kind.startsWith('allow'));
+      if (!defaultOption) return 'A selectedOptionId is required for this permission request';
+      return undefined;
+    }
+    const selected = pending.options.find((option) => option.optionId === selectedOptionId);
     if (!selected) return `Unknown permission option ${selectedOptionId}`;
     const optionApproves = selected.kind.startsWith('allow');
     if (optionApproves !== approved) {
@@ -380,7 +383,10 @@ class AcpV1Process implements AcpAdapter {
     const pending = this.permissions.get(toolCallId);
     if (!pending) return false;
     this.permissions.delete(toolCallId);
-    const selected = pending.options.find((option) => option.optionId === selectedOptionId);
+    const selected = selectedOptionId
+      ? pending.options.find((option) => option.optionId === selectedOptionId)
+      : pending.options.find((option) =>
+        approved ? option.kind.startsWith('allow') : !option.kind.startsWith('allow'));
     pending.resolve(selected
       ? { outcome: { outcome: 'selected', optionId: selected.optionId } }
       : { outcome: { outcome: 'cancelled' } });
@@ -828,10 +834,42 @@ export function requiresCommandShell(
   return platform === 'win32' && /\.(?:cmd|bat)$/i.test(executable);
 }
 
-export function toNativeWorkingDirectory(uri: string): string {
+export function unwrapAgentHostUri(uri: string): string {
   let url: URL;
   try {
     url = new URL(uri);
+  } catch {
+    return uri;
+  }
+  if (url.protocol !== 'vscode-agent-host:') {
+    return uri;
+  }
+  const encoded = url.searchParams.get('_ah');
+  if (!encoded) {
+    return `file://${url.pathname}${url.hash}`;
+  }
+  try {
+    const metadata = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as {
+      scheme?: string;
+      authority?: string;
+      path?: string;
+      query?: string;
+    };
+    const scheme = typeof metadata.scheme === 'string' && metadata.scheme ? metadata.scheme : 'file';
+    const authority = typeof metadata.authority === 'string' && metadata.authority ? `//${metadata.authority}` : scheme === 'file' ? '//' : '';
+    const path = typeof metadata.path === 'string' ? metadata.path : url.pathname;
+    const query = typeof metadata.query === 'string' && metadata.query ? `?${metadata.query}` : '';
+    return `${scheme}:${authority}${path}${query}${url.hash}`;
+  } catch {
+    return `file://${url.pathname}${url.hash}`;
+  }
+}
+
+export function toNativeWorkingDirectory(uri: string): string {
+  const unwrapped = unwrapAgentHostUri(uri);
+  let url: URL;
+  try {
+    url = new URL(unwrapped);
   } catch {
     throw new Error(`Working directory must be an absolute file URI: ${uri}`);
   }

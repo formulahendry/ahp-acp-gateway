@@ -1578,6 +1578,95 @@ test('Changesets and git-blob reads stay inside a subdirectory working root', as
   );
 });
 
+test('VS Code UI tool confirmation without selectedOptionId and wrapped vscode-agent-host:// URIs work end-to-end', async (t) => {
+  const fixture = await startFixture();
+  const repoDir = await mkdtemp(join(tmpdir(), 'ahp-acp-vscode-ui-'));
+  const client = await connectClient(fixture.url, 'vscode-ui-client');
+  t.after(async () => {
+    await client.shutdown();
+    await fixture.close();
+    await rm(repoDir, { recursive: true, force: true });
+  });
+
+  await execFileAsync('git', ['init'], { cwd: repoDir });
+  await execFileAsync('git', ['config', 'user.email', 'test@example.com'], { cwd: repoDir });
+  await execFileAsync('git', ['config', 'user.name', 'Test User'], { cwd: repoDir });
+  await execFileAsync('git', ['config', 'core.autocrlf', 'false'], { cwd: repoDir });
+  const trackedFile = join(repoDir, 'math.js');
+  await writeFile(trackedFile, 'function add(a, b) { return a + b; }\n', 'utf8');
+  await execFileAsync('git', ['add', 'math.js'], { cwd: repoDir });
+  await execFileAsync('git', ['commit', '-m', 'Initial commit'], { cwd: repoDir });
+
+  const session = `ahp-session:/vscode-ui-${crypto.randomUUID()}`;
+  const repoUri = pathToFileURL(repoDir).href;
+  await client.request('createSession', {
+    channel: session,
+    provider: 'fake',
+    workingDirectories: [repoUri],
+  });
+  const sessionState = (await client.subscribe(session)).result.snapshot?.state as SessionState;
+  const chat = sessionState.defaultChat!;
+  const chatSub = (await client.subscribe(chat)).subscription;
+
+  // 1. Trigger a tool call that requires confirmation, and confirm it WITHOUT selectedOptionId
+  // (matching VS Code sidebar Allow button / allowAll / modifiedFilesConfirmation behavior).
+  const turnId = crypto.randomUUID();
+  client.dispatch(chat, userTurn(turnId, 'permission'));
+  const ready = await nextAction(
+    chatSub,
+    (item) =>
+      item.action.type === ActionType.ChatToolCallReady
+      && Array.isArray((item.action as any).options)
+      && (item.action as any).options.length > 0,
+  );
+  const toolCallId = (ready.action as any).toolCallId as string;
+
+  client.dispatch(chat, {
+    type: ActionType.ChatToolCallConfirmed,
+    turnId,
+    toolCallId,
+    approved: true,
+    confirmed: ToolCallConfirmationReason.UserAction,
+  } as StateAction);
+
+  const confirmed = await nextAction(
+    chatSub,
+    (item) => item.action.type === ActionType.ChatToolCallConfirmed && (item.action as any).toolCallId === toolCallId,
+  );
+  assert.equal((confirmed.action as any).selectedOptionId, 'allow');
+  await collectUntil(chatSub, ActionType.ChatTurnComplete);
+
+  // 2. Modify tracked file and verify wrapped vscode-agent-host:// URI works in invokeChangesetOperation
+  await writeFile(trackedFile, 'function add(a, b) { return a + b; }\nfunction mul(a, b) { return a * b; }\n', 'utf8');
+  const uncommittedChannel = `${chat}/changeset/uncommitted`;
+  await client.subscribe(uncommittedChannel);
+  await client.request('createSession', {
+    channel: `ahp-session:/refresh-${crypto.randomUUID()}`,
+    provider: 'fake',
+    workingDirectories: [repoUri],
+  }).catch(() => {});
+
+  // Run another quick turn to refresh changesets
+  client.dispatch(chat, userTurn(crypto.randomUUID(), 'hello'));
+  await collectUntil(chatSub, ActionType.ChatTurnComplete);
+
+  const canonicalTrackedUri = pathToFileURL(await realpath(trackedFile)).href;
+  const parsedTrackedUrl = new URL(canonicalTrackedUri);
+  const ahPayload = Buffer.from(JSON.stringify({ scheme: 'file' }), 'utf8').toString('base64url');
+  const wrappedResourceUri = `vscode-agent-host://hex-3132372e302e302e313a31383039302f616870${parsedTrackedUrl.pathname}?_ah=${ahPayload}`;
+
+  await client.request('invokeChangesetOperation', {
+    channel: uncommittedChannel,
+    operationId: 'discard-changes',
+    target: {
+      kind: ChangesetOperationTargetKind.Resource,
+      resource: wrappedResourceUri,
+    },
+  });
+
+  assert.equal(await readFile(trackedFile, 'utf8'), 'function add(a, b) { return a + b; }\n');
+});
+
 function storedSession(resource: string, chat: string, now: string) {
   return {
     resource,
