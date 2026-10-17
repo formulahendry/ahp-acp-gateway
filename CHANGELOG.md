@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.2.1
+
+- Multimodal message attachment support (`Message.attachments` -> ACP
+  `ContentBlock[]`), covering workspace file/directory/image resources,
+  code selection slicing (`#Lstart-Lend`), clipboard images and pasted text
+  (`embeddedResource`), `simple` context, `annotations`, and prior `chat`
+  transcripts
+- Workspace path boundary enforcement on local file attachments and automatic
+  capability fallback based on ACP `promptCapabilities` (`image`, `audio`,
+  `embeddedContext`)
+
 ## 0.2.0
 
 - Inline `fileEdit` tool call results mapped from ACP native `diff` payloads
