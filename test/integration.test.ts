@@ -15,6 +15,7 @@ import {
   ContentEncoding,
   MessageKind,
   PROTOCOL_VERSION,
+  ResourceChangeType,
   SessionStatus,
   TerminalClaimKind,
   ToolCallConfirmationReason,
@@ -1281,7 +1282,12 @@ test('restored sessions via ACP session/load retain configOptionTypes and syncCh
   await firstClient.shutdown();
   await firstServer.close();
 
-  const secondServer = new GatewayServer(testConfig(directory));
+  const secondConfig = testConfig(directory);
+  secondConfig.providers[0]!.env = {
+    ...secondConfig.providers[0]!.env,
+    ACP_REPLAY_ON_LOAD: '1',
+  };
+  const secondServer = new GatewayServer(secondConfig);
   const secondAddress = await secondServer.listen();
   const secondUrl = `ws://${secondAddress.host}:${secondAddress.port}${secondAddress.path}`;
   const secondClient = await connectClient(secondUrl, 'second-load-client');
@@ -1304,6 +1310,10 @@ test('restored sessions via ACP session/load retain configOptionTypes and syncCh
     const actions = await collectUntil(chatSub, ActionType.ChatTurnComplete);
     assert.ok(actions.some((item) =>
       item.action.type === ActionType.ChatDelta && item.action.content === 'model:fake-model-2'));
+    assert.doesNotMatch(JSON.stringify(actions), /HISTORICAL_LOAD_REPLAY/);
+    const restoredTurn = (secondServer.store.getChat(chat)?.state as ChatState)
+      .turns.find((turn) => turn.id === turnId);
+    assert.doesNotMatch(JSON.stringify(restoredTurn?.responseParts), /HISTORICAL_LOAD_REPLAY/);
 
     // SessionConfigChanged on restored session also works
     secondClient.dispatch(session, {
@@ -1315,6 +1325,39 @@ test('restored sessions via ACP session/load retain configOptionTypes and syncCh
   } finally {
     await secondClient.shutdown();
     await secondServer.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('startup repairs changeset catalogs for sessions persisted by older versions', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'ahp-acp-legacy-changesets-'));
+  const config = testConfig(directory);
+  const store = new GatewayStore(config.database.path, config.replay.maxActions);
+  const now = new Date().toISOString();
+  const sessionResource = `ahp-session:/legacy-${crypto.randomUUID()}`;
+  const chatResource = `ahp-chat:/legacy-${crypto.randomUUID()}`;
+  const session = storedSession(sessionResource, chatResource, now);
+  session.state.workingDirectories = [pathToFileURL(process.cwd()).href];
+  store.putSession(session);
+  store.putChat(storedChat(sessionResource, chatResource, now));
+  store.close();
+
+  const server = new GatewayServer(config);
+  try {
+    const repairedSession = server.store.getSession(sessionResource)?.state as SessionState;
+    const repairedChat = server.store.getChat(chatResource)?.state as ChatState;
+    assert.deepEqual(
+      repairedSession.changesets?.map((changeset) => changeset.changeKind),
+      ['session'],
+    );
+    assert.deepEqual(
+      repairedChat.changesets?.map((changeset) => changeset.changeKind),
+      ['uncommitted', 'session', 'turn'],
+    );
+    assert.ok(server.store.getChannel(`${chatResource}/changeset/uncommitted`));
+    assert.ok(server.store.getChannel(`${sessionResource}/changeset/session`));
+  } finally {
+    await server.close();
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -1363,17 +1406,47 @@ test('Changeset channels, git-blob resourceRead, review state, discard-changes, 
   const watchState = watchSubscribed.result.snapshot?.state as ResourceWatchState;
   assert.equal(watchState.recursive, true);
 
-  // Modify tracked file and add untracked file
+  // Modifying an existing file reports Updated.
   await writeFile(trackedFile, 'line1\nline2-modified\nline3\n', 'utf8');
+  const updatedWatchAction = await nextAction(
+    watchSubscribed.subscription,
+    (item) =>
+      item.action.type === ActionType.ResourceWatchChanged
+      && item.action.changes.items.some((change) =>
+        change.uri.endsWith('/hello.txt') && change.type === ResourceChangeType.Updated),
+  );
+  assert.ok(
+    updatedWatchAction.action.type === ActionType.ResourceWatchChanged
+    && updatedWatchAction.action.changes.items.some((change) =>
+      change.uri.endsWith('/hello.txt') && change.type === ResourceChangeType.Updated),
+  );
+
+  // Creating and deleting a file report Added and Deleted.
   const untrackedFile = join(repoDir, 'added.txt');
   await writeFile(untrackedFile, 'new file content\n', 'utf8');
-
-  // Verify resourceWatch emits ResourceWatchChanged
-  const watchAction = await nextAction(
+  await nextAction(
     watchSubscribed.subscription,
-    (item) => item.action.type === ActionType.ResourceWatchChanged,
+    (item) =>
+      item.action.type === ActionType.ResourceWatchChanged
+      && item.action.changes.items.some((change) =>
+        change.uri.endsWith('/added.txt') && change.type === ResourceChangeType.Added),
   );
-  assert.ok((watchAction.action as any).changes.items.length >= 1);
+  await rm(untrackedFile);
+  await nextAction(
+    watchSubscribed.subscription,
+    (item) =>
+      item.action.type === ActionType.ResourceWatchChanged
+      && item.action.changes.items.some((change) =>
+        change.uri.endsWith('/added.txt') && change.type === ResourceChangeType.Deleted),
+  );
+  await writeFile(untrackedFile, 'new file content\n', 'utf8');
+  await nextAction(
+    watchSubscribed.subscription,
+    (item) =>
+      item.action.type === ActionType.ResourceWatchChanged
+      && item.action.changes.items.some((change) =>
+        change.uri.endsWith('/added.txt') && change.type === ResourceChangeType.Added),
+  );
 
   // 2. Run a turn so changesets refresh automatically
   const chatSub = (await client.subscribe(chat)).subscription;
@@ -1440,6 +1513,69 @@ test('Changeset channels, git-blob resourceRead, review state, discard-changes, 
   await client.unsubscribe(watchRes.channel);
   await waitForCondition(() => fixture.server.store.getChannel(watchRes.channel) === undefined);
   assert.equal(fixture.server.store.getChannel(watchRes.channel), undefined);
+});
+
+test('Changesets and git-blob reads stay inside a subdirectory working root', async (t) => {
+  const fixture = await startFixture();
+  const repoDir = await mkdtemp(join(tmpdir(), 'ahp-acp-subdir-repo-'));
+  const client = await connectClient(fixture.url, 'changeset-subdir-client');
+  t.after(async () => {
+    await client.shutdown();
+    await fixture.close();
+    await rm(repoDir, { recursive: true, force: true });
+  });
+
+  const allowedDir = join(repoDir, 'allowed');
+  const outsideDir = join(repoDir, 'outside');
+  await mkdir(allowedDir);
+  await mkdir(outsideDir);
+  await execFileAsync('git', ['init'], { cwd: repoDir });
+  await execFileAsync('git', ['config', 'user.email', 'test@example.com'], { cwd: repoDir });
+  await execFileAsync('git', ['config', 'user.name', 'Test User'], { cwd: repoDir });
+  await execFileAsync('git', ['config', 'core.autocrlf', 'false'], { cwd: repoDir });
+  const insideFile = join(allowedDir, 'inside.txt');
+  const outsideFile = join(outsideDir, 'secret.txt');
+  await writeFile(insideFile, 'inside base\n', 'utf8');
+  await writeFile(outsideFile, 'outside base\n', 'utf8');
+  await execFileAsync('git', ['add', '.'], { cwd: repoDir });
+  await execFileAsync('git', ['commit', '-m', 'Initial commit'], { cwd: repoDir });
+
+  const session = `ahp-session:/changeset-subdir-${crypto.randomUUID()}`;
+  await client.request('createSession', {
+    channel: session,
+    provider: 'fake',
+    workingDirectories: [pathToFileURL(allowedDir).href],
+  });
+  const sessionState = (await client.subscribe(session)).result.snapshot?.state as SessionState;
+  const chat = sessionState.defaultChat!;
+
+  await writeFile(insideFile, 'inside changed\n', 'utf8');
+  await writeFile(outsideFile, 'outside changed\n', 'utf8');
+
+  const uncommittedChannel = `${chat}/changeset/uncommitted`;
+  await client.subscribe(uncommittedChannel);
+  await waitForCondition(() => {
+    const state = fixture.server.store.getChannel(uncommittedChannel) as ChangesetState | undefined;
+    return state?.status === ChangesetStatus.Ready && state.files.length > 0;
+  });
+  const changeset = fixture.server.store.getChannel(uncommittedChannel) as ChangesetState;
+  assert.deepEqual(
+    changeset.files.map((file) => file.id),
+    [pathToFileURL(insideFile).href],
+  );
+
+  const outsideBlobUri = `git-blob:/outside/secret.txt?${encodeURIComponent(JSON.stringify({
+    sessionUri: session,
+    sha: 'HEAD',
+    repoRelativePath: 'outside/secret.txt',
+  }))}`;
+  await assert.rejects(
+    client.request('resourceRead', {
+      channel: 'ahp-root://',
+      uri: outsideBlobUri,
+    }),
+    /Permission denied/,
+  );
 });
 
 function storedSession(resource: string, chat: string, now: string) {

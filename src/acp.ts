@@ -252,16 +252,17 @@ class AcpV1Process implements AcpAdapter {
   async prompt(turnId: string, text: string): Promise<void> {
     const startedAt = Date.now();
     let requestStarted = false;
-    this.currentTurn = { id: turnId, startedAt };
     this.cancelRequested = false;
-    this.promptSettled = new Promise((resolve) => {
-      this.resolvePromptSettled = resolve;
-    });
     try {
       await this.start();
+      if (this.cancelRequested) return;
       if (!this.context || !this.binding.acpSessionId) {
         throw new Error('ACP process is not initialized');
       }
+      this.currentTurn = { id: turnId, startedAt };
+      this.promptSettled = new Promise((resolve) => {
+        this.resolvePromptSettled = resolve;
+      });
       requestStarted = true;
       const result = await withTimeout(
         this.context.request(acp.methods.agent.session.prompt, {

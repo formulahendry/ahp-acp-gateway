@@ -65,7 +65,7 @@ interface Connection {
 interface ActiveResourceWatcher {
   watcher: FSWatcher;
   timer?: NodeJS.Timeout | undefined;
-  pendingPaths: Set<string>;
+  pendingEvents: Map<string, 'change' | 'rename'>;
   knownExists: Map<string, boolean>;
 }
 
@@ -129,6 +129,7 @@ export class GatewayServer {
       });
     }
     this.store.repairInterruptedTurns();
+    this.repairChangesetCatalogs();
     this.httpServer = createServer((request, response) => {
       if (request.url === '/healthz') {
         response.writeHead(200, { 'content-type': 'application/json' });
@@ -1233,6 +1234,33 @@ export class GatewayServer {
     }
   }
 
+  private repairChangesetCatalogs(): void {
+    for (const session of this.store.listSessions(10_000, 0)) {
+      if (!session.state.workingDirectories?.length) continue;
+      const chatResource = session.state.defaultChat ?? session.state.chats[0]?.resource;
+      if (!chatResource) continue;
+      const chat = this.store.getChat(chatResource);
+      if (!chat) continue;
+
+      const sessionChangesets = buildSessionChangesets(session.resource);
+      if (JSON.stringify(session.state.changesets) !== JSON.stringify(sessionChangesets)) {
+        this.store.apply(session.resource, {
+          type: ActionType.SessionChangesetsChanged,
+          changesets: sessionChangesets,
+        } as StateAction);
+      }
+
+      const chatChangesets = buildChatChangesets(chatResource, session.resource);
+      if (JSON.stringify(chat.state.changesets) !== JSON.stringify(chatChangesets)) {
+        this.store.apply(chatResource, {
+          type: ActionType.ChatChangesetsChanged,
+          changesets: chatChangesets,
+        } as StateAction);
+      }
+      this.ensureStaticChangesets(session.resource, chatResource);
+    }
+  }
+
   private parseChangesetChannelWithStore(channel: string): ParsedChangesetChannel | undefined {
     const parsed = parseChangesetChannel(channel);
     if (!parsed) return undefined;
@@ -1454,6 +1482,11 @@ export class GatewayServer {
     if (!repoRoot) {
       throw new RpcError(-32008, `Git repository not found for ${uri}`);
     }
+    const canonicalCwd = await realpath(cwd).catch(() => resolvePath(cwd));
+    const blobPath = resolvePath(repoRoot, query.repoRelativePath);
+    if (!isPathWithin(canonicalCwd, blobPath)) {
+      throw new RpcError(-32009, `Permission denied: ${uri}`);
+    }
     try {
       const { stdout } = await execFileAsync(
         'git',
@@ -1511,7 +1544,7 @@ export class GatewayServer {
     const knownExists = new Map<string, boolean>();
     let watcher: FSWatcher;
     try {
-      watcher = watchFs(rootPath, { recursive: Boolean(state.recursive) }, (_eventType, filename) => {
+      watcher = watchFs(rootPath, { recursive: Boolean(state.recursive) }, (eventType, filename) => {
         if (!filename) return;
         const normalizedRel = String(filename).replace(/\\/g, '/');
         if (shouldIgnoreWatchedPath(normalizedRel, state.excludes?.items, state.includes?.items)) {
@@ -1519,7 +1552,10 @@ export class GatewayServer {
         }
         const entry = this.resourceWatchers.get(channel);
         if (!entry) return;
-        entry.pendingPaths.add(resolvePath(rootPath, String(filename)));
+        const fullPath = resolvePath(rootPath, String(filename));
+        if (entry.pendingEvents.get(fullPath) !== 'rename') {
+          entry.pendingEvents.set(fullPath, eventType);
+        }
         if (entry.timer) clearTimeout(entry.timer);
         entry.timer = setTimeout(() => {
           void this.flushResourceWatchChanges(channel);
@@ -1533,7 +1569,7 @@ export class GatewayServer {
     });
     this.resourceWatchers.set(channel, {
       watcher,
-      pendingPaths: new Set(),
+      pendingEvents: new Map(),
       knownExists,
     });
   }
@@ -1541,13 +1577,13 @@ export class GatewayServer {
   private async flushResourceWatchChanges(channel: string): Promise<void> {
     const entry = this.resourceWatchers.get(channel);
     if (!entry || this.closing || !this.store.getChannel(channel)) return;
-    const paths = [...entry.pendingPaths];
-    entry.pendingPaths.clear();
+    const changes = [...entry.pendingEvents];
+    entry.pendingEvents.clear();
     entry.timer = undefined;
-    if (paths.length === 0) return;
+    if (changes.length === 0) return;
 
     const items: Array<{ uri: string; type: ResourceChangeType }> = [];
-    for (const fullPath of paths) {
+    for (const [fullPath, eventType] of changes) {
       const existedBefore = entry.knownExists.get(fullPath);
       let existsNow = false;
       try {
@@ -1559,7 +1595,7 @@ export class GatewayServer {
       entry.knownExists.set(fullPath, existsNow);
       const changeType = !existsNow
         ? ResourceChangeType.Deleted
-        : existedBefore === true
+        : eventType === 'change' || existedBefore === true
           ? ResourceChangeType.Updated
           : ResourceChangeType.Added;
       items.push({
@@ -2279,6 +2315,7 @@ async function computeWorkingDirectoryChanges(
       summary: { additions: 0, deletions: 0, files: 0 },
     };
   }
+  const canonicalCwd = await realpath(cwd).catch(() => resolvePath(cwd));
 
   let hasHead = true;
   try {
@@ -2290,7 +2327,7 @@ async function computeWorkingDirectoryChanges(
   const numstatByPath = new Map<string, { added: number; removed: number }>();
   if (hasHead) {
     try {
-      const { stdout } = await execFileAsync('git', ['-C', repoRoot, 'diff', '--numstat', 'HEAD']);
+      const { stdout } = await execFileAsync('git', ['-C', cwd, 'diff', '--numstat', 'HEAD', '--', '.']);
       for (const line of stdout.split(/\r?\n/)) {
         if (!line.trim()) continue;
         const parts = line.split('\t');
@@ -2312,11 +2349,13 @@ async function computeWorkingDirectoryChanges(
   try {
     const res = await execFileAsync('git', [
       '-C',
-      repoRoot,
+      cwd,
       'status',
       '--porcelain=v1',
       '-z',
       '--untracked-files=all',
+      '--',
+      '.',
     ]);
     statusStdout = res.stdout;
   } catch {
@@ -2342,6 +2381,7 @@ async function computeWorkingDirectoryChanges(
       if (origRepoPath !== undefined) i++;
     }
     const fullPath = join(repoRoot, repoPath);
+    if (!isPathWithin(canonicalCwd, resolvePath(fullPath))) continue;
     const fileUri = pathToFileURL(fullPath).href;
     const isUntracked = xy === '??';
     const isAdded = isUntracked || (xy[0] === 'A' && !hasHead) || (xy[0] === 'A' && xy[1] !== 'D');
@@ -2361,16 +2401,20 @@ async function computeWorkingDirectoryChanges(
     totalAdditions += diff.added;
     totalDeletions += diff.removed;
 
-    const beforeRepoPath = origRepoPath ?? repoPath;
-    const beforeFileUri = origRepoPath
-      ? pathToFileURL(join(repoRoot, origRepoPath)).href
+    const originalFullPath = origRepoPath ? resolvePath(repoRoot, origRepoPath) : undefined;
+    const originalInScope = originalFullPath
+      ? isPathWithin(canonicalCwd, originalFullPath)
+      : true;
+    const beforeRepoPath = originalInScope ? origRepoPath ?? repoPath : repoPath;
+    const beforeFileUri = originalInScope && origRepoPath
+      ? pathToFileURL(originalFullPath!).href
       : fileUri;
     const gitBlobUri = buildGitBlobUri(sessionUri, 'HEAD', beforeRepoPath);
 
     files.push({
       id: fileUri,
       edit: {
-        ...(isAdded && !origRepoPath
+        ...((isAdded && !origRepoPath) || !originalInScope
           ? {}
           : {
               before: {

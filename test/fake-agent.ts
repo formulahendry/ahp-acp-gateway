@@ -71,12 +71,21 @@ acp.agent({ name: 'ahp-acp-gateway-test-agent' })
       configOptions: configOptions(sessionId),
     } as any;
   })
-  .onRequest(acp.methods.agent.session.load, (ctx) => {
+  .onRequest(acp.methods.agent.session.load, async (ctx) => {
     sessions.set(ctx.params.sessionId, undefined);
     if (!sessionConfigValues.has(ctx.params.sessionId)) {
       sessionConfigValues.set(ctx.params.sessionId, {
         model: 'fake-model',
         mode: 'interactive',
+      });
+    }
+    if (process.env.ACP_REPLAY_ON_LOAD === '1') {
+      await ctx.client.notify(acp.methods.client.session.update, {
+        sessionId: ctx.params.sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'HISTORICAL_LOAD_REPLAY' },
+        },
       });
     }
     return {
