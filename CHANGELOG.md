@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.2.0
+
+- Inline `fileEdit` tool call results mapped from ACP native `diff` payloads
+  with SQLite-persisted `session-db:` before/after snapshots
+- Native AHP changeset channels (`uncommitted`, `session`, and per-turn
+  changesets), review state tracking, and `discard-changes` operation across
+  both Git repositories (`git-blob:` resources) and non-Git workspaces
+- File and directory watching via `createResourceWatch` and
+  `resourceWatch/changed` notifications
+- Fixed VS Code Agent Window tool confirmation when `selectedOptionId` is
+  omitted and unwrapped `vscode-agent-host:` resource URIs
+- Fixed streaming markdown response part ordering around tool calls and
+  reasoning blocks
+- Fixed root `activeClients` tracking, dynamic model catalogue propagation, and
+  `session/load` restoration metadata
+
 ## 0.1.0
 
 Initial public MVP release.

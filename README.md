@@ -117,7 +117,11 @@ ahp-acp-gateway
 - Bounded reconnect replay with snapshot fallback
 - Restart repair for interrupted turns
 - ACP `session/load` after restart when supported
-- Read-only remote folder discovery and file opening for AHP clients
+- Inline `fileEdit` diffs (`session-db:` snapshots) and changeset channels
+  (`uncommitted`, `session`, and per-turn changesets) with `discard-changes`
+  across Git and non-Git workspaces
+- Read-only remote folder discovery, file opening, and `createResourceWatch`
+  file watching for AHP clients
 - Basic pipe-backed Agent Host terminal lifecycle
 - ACP commands exposed as AHP slash completions
 - Explicit errors for unsupported protocol methods
@@ -240,12 +244,13 @@ AHP-ACP Gateway is a protocol bridge, not a sandbox.
 
 - ACP v1 only.
 - One public chat per session; `createChat` is not implemented.
-- Resource access is read-only: folder listing, metadata resolution, and file
-  reads are implemented; writes, copies, moves, deletes, and watches are not.
+- Resource access is read-only: folder listing, metadata resolution, file reads,
+  and resource watches (`createResourceWatch`) are implemented; direct resource
+  writes, copies, moves, and deletes are not.
 - Terminals are pipe-backed rather than true PTYs; resize propagation and
   command detection are not implemented.
-- No changesets, MCP forwarding, attachments/images, forks, multi-user policy,
-  or built-in sandbox.
+- No MCP forwarding, attachments/images, forks, multi-user policy, or built-in
+  sandbox.
 - Filesystem RPC requested by ACP agents is not advertised.
 - AHP windowed subscriptions are not implemented.
 - The provider catalog is bundled and updated manually rather than synchronized
