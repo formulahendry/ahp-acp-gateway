@@ -120,6 +120,9 @@ ahp-acp-gateway
 - Inline `fileEdit` diffs (`session-db:` snapshots) and changeset channels
   (`uncommitted`, `session`, and per-turn changesets) with `discard-changes`
   across Git and non-Git workspaces
+- Multimodal message attachments (`Message.attachments` -> ACP `ContentBlock[]`)
+  for workspace files/selections, clipboard images, pasted text, annotations,
+  and prior chat transcripts with automatic `promptCapabilities` fallback
 - Read-only remote folder discovery, file opening, and `createResourceWatch`
   file watching for AHP clients
 - Basic pipe-backed Agent Host terminal lifecycle
@@ -249,8 +252,7 @@ AHP-ACP Gateway is a protocol bridge, not a sandbox.
   writes, copies, moves, and deletes are not.
 - Terminals are pipe-backed rather than true PTYs; resize propagation and
   command detection are not implemented.
-- No MCP forwarding, attachments/images, forks, multi-user policy, or built-in
-  sandbox.
+- No MCP forwarding, forks, multi-user policy, or built-in sandbox.
 - Filesystem RPC requested by ACP agents is not advertised.
 - AHP windowed subscriptions are not implemented.
 - The provider catalog is bundled and updated manually rather than synchronized
