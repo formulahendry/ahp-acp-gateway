@@ -1,9 +1,9 @@
 import { timingSafeEqual } from 'node:crypto';
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { watch as watchFs, type FSWatcher } from 'node:fs';
-import { lstat, readFile, readdir, realpath, rm, stat } from 'node:fs/promises';
+import { lstat, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
-import { extname, isAbsolute, join, relative, resolve as resolvePath } from 'node:path';
+import { dirname, extname, isAbsolute, join, relative, resolve as resolvePath } from 'node:path';
 import { promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
 import {
@@ -38,13 +38,19 @@ import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import type { GatewayConfig, ProviderConfig } from './config.js';
 import {
   AcpV1AdapterFactory,
+  computeLineDiffStats,
   terminateProcessTree,
   toNativeWorkingDirectory,
   unwrapAgentHostUri,
   type AcpAdapter,
   type AcpAdapterFactory,
 } from './acp.js';
-import { GatewayStore, type AcpBinding, type StoredSession } from './store.js';
+import {
+  GatewayStore,
+  type AcpBinding,
+  type StoredFileEditSnapshot,
+  type StoredSession,
+} from './store.js';
 import { VERSION } from './version.js';
 
 const execFileAsync = promisify(execFile);
@@ -511,6 +517,9 @@ export class GatewayServer {
     if (uri.startsWith('git-blob:')) {
       return this.readGitBlobResource(uri, requestedEncoding);
     }
+    if (uri.startsWith('session-db:')) {
+      return this.readSessionDbResource(uri, requestedEncoding);
+    }
     const path = resourcePath(uri);
     try {
       const canonicalPath = await realpath(path);
@@ -959,6 +968,12 @@ export class GatewayServer {
       binding,
       session.state.workingDirectories ?? [],
       {
+        recordFileEdit: (snapshot) => {
+          this.store.recordFileEditSnapshot({
+            sessionUri: chat.session,
+            ...snapshot,
+          });
+        },
         emit: (action) => {
           const envelope = this.store.apply(chatResource, action);
           this.broadcastAction(envelope);
@@ -1310,7 +1325,11 @@ export class GatewayServer {
 
     this.ensureStaticChangesets(sessionResource, chatResource);
     const cwd = resourcePath(workingDirUri);
-    const { files, summary: changesSummary } = await computeWorkingDirectoryChanges(cwd, sessionResource);
+    const repoRoot = await getGitRepoRoot(cwd);
+    const sessionSnapshots = this.store.listFileEditSnapshots(sessionResource);
+    const { files, summary: changesSummary } = repoRoot
+      ? await computeWorkingDirectoryChanges(cwd, sessionResource)
+      : await computeSnapshotWorkingDirectoryChanges(cwd, sessionResource, sessionSnapshots);
     if (this.closing) return;
 
     const uncommittedUri = `${chatResource}/changeset/uncommitted`;
@@ -1326,7 +1345,11 @@ export class GatewayServer {
           operations: [],
         });
       }
-      this.updateChangesetChannel(turnUri, files, []);
+      const turnSnapshots = this.store.listFileEditSnapshots(sessionResource, turnId);
+      const turnFiles = turnSnapshots.length > 0
+        ? buildTurnSnapshotChangesetFiles(cwd, sessionResource, turnSnapshots)
+        : files;
+      this.updateChangesetChannel(turnUri, turnFiles, []);
     }
 
     const latestSession = this.store.getSession(sessionResource);
@@ -1445,9 +1468,105 @@ export class GatewayServer {
       } else {
         await execFileAsync('git', ['-C', repoRoot, 'checkout', 'HEAD', '--', relPath]);
       }
+      this.store.deleteFileEditSnapshotsForFile(parsed.sessionUri, targetResource);
+      this.store.deleteFileEditSnapshotsForFile(parsed.sessionUri, pathToFileURL(canonicalTarget).href);
+    } else {
+      const snapshots = this.store.listFileEditSnapshots(parsed.sessionUri);
+      const canonicalTargetUri = pathToFileURL(canonicalTarget).href;
+      const matching = snapshots.filter((item) => {
+        if (item.fileUri === targetResource || item.fileUri === canonicalTargetUri) return true;
+        try {
+          return resolvePath(resourcePath(item.fileUri)) === resolvePath(targetPath);
+        } catch {
+          return false;
+        }
+      });
+      if (matching.length > 0) {
+        const firstSnapshot = matching[0]!;
+        if (firstSnapshot.oldText === null) {
+          await rm(canonicalTarget, { force: true, recursive: true });
+        } else {
+          await mkdir(dirname(canonicalTarget), { recursive: true });
+          await writeFile(canonicalTarget, firstSnapshot.oldText, 'utf8');
+        }
+        const uniqueUris = new Set(matching.map((item) => item.fileUri));
+        uniqueUris.add(targetResource);
+        uniqueUris.add(canonicalTargetUri);
+        for (const fileUri of uniqueUris) {
+          this.store.deleteFileEditSnapshotsForFile(parsed.sessionUri, fileUri);
+        }
+      }
     }
     await this.refreshSessionChangesets(parsed.sessionUri);
     return null;
+  }
+
+  private async readSessionDbResource(
+    uri: string,
+    requestedEncoding: unknown,
+  ): Promise<{ data: string; encoding: string; contentType: string }> {
+    let parsed: URL;
+    try {
+      parsed = new URL(uri);
+    } catch {
+      throw new RpcError(-32602, `Invalid session-db URI: ${uri}`);
+    }
+    let query: {
+      sessionUri?: string;
+      toolCallId?: string;
+      fileUri?: string;
+      filePath?: string;
+      part?: string;
+    };
+    try {
+      query = JSON.parse(decodeURIComponent(parsed.search.replace(/^\?/, ''))) as {
+        sessionUri?: string;
+        toolCallId?: string;
+        fileUri?: string;
+        filePath?: string;
+        part?: string;
+      };
+    } catch {
+      throw new RpcError(-32602, `Invalid session-db query in URI: ${uri}`);
+    }
+    const toolCallId = typeof query.toolCallId === 'string' ? query.toolCallId : undefined;
+    const rawFileUri = typeof query.fileUri === 'string'
+      ? query.fileUri
+      : typeof query.filePath === 'string'
+        ? query.filePath
+        : undefined;
+    const part = query.part === 'before' || query.part === 'after' ? query.part : undefined;
+    if (!toolCallId || !rawFileUri || !part) {
+      throw new RpcError(-32602, `Missing session-db query parameters in URI: ${uri}`);
+    }
+    const fileUri = unwrapAgentHostUri(rawFileUri);
+    let snapshot: StoredFileEditSnapshot | undefined;
+    if (typeof query.sessionUri === 'string' && query.sessionUri.length > 0) {
+      snapshot = this.store.getFileEditSnapshot(query.sessionUri, toolCallId, fileUri);
+    }
+    if (!snapshot) {
+      for (const session of this.store.listSessions(10_000, 0)) {
+        snapshot = this.store.getFileEditSnapshot(session.resource, toolCallId, fileUri);
+        if (snapshot) break;
+      }
+    }
+    if (!snapshot) {
+      throw new RpcError(-32008, `Session snapshot not found: ${uri}`);
+    }
+    const text = part === 'before' ? (snapshot.oldText ?? '') : (snapshot.newText ?? '');
+    const buffer = Buffer.from(text, 'utf8');
+    const encoding = (requestedEncoding as 'utf-8' | 'base64' | undefined) ?? 'utf-8';
+    let targetPath = parsed.pathname || 'file.txt';
+    try {
+      targetPath = resourcePath(fileUri);
+    } catch {
+      // Keep pathname fallback
+    }
+    return {
+      data: encoding === 'utf-8' ? buffer.toString('utf8') : buffer.toString('base64'),
+      encoding,
+      contentType: contentType(targetPath),
+    };
   }
 
   private async readGitBlobResource(
@@ -2478,6 +2597,157 @@ function buildGitBlobUri(sessionUri: string, sha: string, repoRelativePath: stri
     repoRelativePath: repoRelativePath.replace(/^\/+/, ''),
   }));
   return `git-blob:${normalizedPath}?${query}`;
+}
+
+function buildSessionDbUri(
+  sessionUri: string,
+  toolCallId: string,
+  fileUri: string,
+  part: 'before' | 'after',
+): string {
+  let pathname = '/file';
+  try {
+    pathname = new URL(fileUri).pathname || '/file';
+  } catch {
+    // Keep fallback pathname.
+  }
+  const query = encodeURIComponent(JSON.stringify({
+    sessionUri,
+    toolCallId,
+    fileUri,
+    part,
+  }));
+  return `session-db:${pathname}?${query}`;
+}
+
+function buildTurnSnapshotChangesetFiles(
+  cwd: string,
+  sessionUri: string,
+  snapshots: StoredFileEditSnapshot[],
+): ChangesetFile[] {
+  const canonicalCwd = resolvePath(cwd);
+  const grouped = new Map<string, { first: StoredFileEditSnapshot; last: StoredFileEditSnapshot }>();
+  for (const snapshot of snapshots) {
+    try {
+      const targetPath = resolvePath(resourcePath(snapshot.fileUri));
+      if (!isPathWithin(canonicalCwd, targetPath)) continue;
+    } catch {
+      continue;
+    }
+    const existing = grouped.get(snapshot.fileUri);
+    if (!existing) {
+      grouped.set(snapshot.fileUri, { first: snapshot, last: snapshot });
+    } else {
+      existing.last = snapshot;
+    }
+  }
+  const files: ChangesetFile[] = [];
+  for (const [fileUri, { first, last }] of grouped.entries()) {
+    const diff = computeLineDiffStats(first.oldText, last.newText);
+    const beforeUri = buildSessionDbUri(sessionUri, first.toolCallId, fileUri, 'before');
+    const afterUri = buildSessionDbUri(sessionUri, last.toolCallId, fileUri, 'after');
+    files.push({
+      id: fileUri,
+      edit: {
+        ...(first.oldText !== null
+          ? {
+              before: {
+                uri: fileUri,
+                content: { uri: beforeUri },
+              },
+            }
+          : {}),
+        ...(last.newText !== null
+          ? {
+              after: {
+                uri: fileUri,
+                content: { uri: afterUri },
+              },
+            }
+          : {}),
+        diff,
+      },
+    });
+  }
+  return files;
+}
+
+async function computeSnapshotWorkingDirectoryChanges(
+  cwd: string,
+  sessionUri: string,
+  snapshots: StoredFileEditSnapshot[],
+): Promise<{ files: ChangesetFile[]; summary: ChangesSummary }> {
+  const canonicalCwd = await realpath(cwd).catch(() => resolvePath(cwd));
+  const grouped = new Map<string, { first: StoredFileEditSnapshot; last: StoredFileEditSnapshot }>();
+  for (const snapshot of snapshots) {
+    try {
+      const targetPath = await realpath(resourcePath(snapshot.fileUri)).catch(() => resolvePath(resourcePath(snapshot.fileUri)));
+      if (!isPathWithin(canonicalCwd, targetPath)) continue;
+    } catch {
+      continue;
+    }
+    const existing = grouped.get(snapshot.fileUri);
+    if (!existing) {
+      grouped.set(snapshot.fileUri, { first: snapshot, last: snapshot });
+    } else {
+      existing.last = snapshot;
+    }
+  }
+  const files: ChangesetFile[] = [];
+  let totalAdditions = 0;
+  let totalDeletions = 0;
+
+  for (const [fileUri, { first, last }] of grouped.entries()) {
+    const filePath = resourcePath(fileUri);
+    let currentText: string | null = null;
+    try {
+      const buf = await readFile(filePath);
+      currentText = isUtf8(buf) ? buf.toString('utf8') : last.newText;
+    } catch {
+      currentText = null;
+    }
+    if (first.oldText === null && currentText === null) {
+      continue;
+    }
+    if (first.oldText !== null && currentText !== null && first.oldText === currentText) {
+      continue;
+    }
+    const diff = computeLineDiffStats(first.oldText, currentText);
+    totalAdditions += diff.added;
+    totalDeletions += diff.removed;
+    const beforeUri = buildSessionDbUri(sessionUri, first.toolCallId, fileUri, 'before');
+    files.push({
+      id: fileUri,
+      edit: {
+        ...(first.oldText !== null
+          ? {
+              before: {
+                uri: fileUri,
+                content: { uri: beforeUri },
+              },
+            }
+          : {}),
+        ...(currentText !== null
+          ? {
+              after: {
+                uri: fileUri,
+                content: { uri: fileUri },
+              },
+            }
+          : {}),
+        diff,
+      },
+    });
+  }
+
+  return {
+    files,
+    summary: {
+      additions: totalAdditions,
+      deletions: totalDeletions,
+      files: files.length,
+    },
+  };
 }
 
 function parseFilterPatternList(

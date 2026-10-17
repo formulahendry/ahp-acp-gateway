@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
-import { resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { isAbsolute, resolve } from 'node:path';
 import { Readable, Writable } from 'node:stream';
 import * as acp from '@agentclientprotocol/sdk';
 import {
@@ -8,13 +8,16 @@ import {
   ConfirmationOptionKind,
   ResponsePartKind,
   ToolCallConfirmationReason,
+  ToolResultContentType,
   type StateAction,
+  type ToolResultContent,
 } from '@microsoft/agent-host-protocol';
 import type { ProviderConfig } from './config.js';
-import type { AcpBinding } from './store.js';
+import type { AcpBinding, StoredFileEditSnapshot } from './store.js';
 
 export interface AcpAdapterCallbacks {
   emit(action: StateAction): void;
+  recordFileEdit?(snapshot: Omit<StoredFileEditSnapshot, 'sessionUri'>): void;
   bindingChanged(binding: AcpBinding): void;
   ready(): void;
   modelsChanged(models: Array<{ id: string; name: string; description?: string; _meta?: Record<string, unknown> | null }>): void;
@@ -574,6 +577,7 @@ class AcpV1Process implements AcpAdapter {
         turn.markdownPart = undefined;
         turn.reasoningPart = undefined;
         this.toolTitles.set(update.toolCallId, update.title);
+        const toolInput = serializeToolInput(update.rawInput);
         this.callbacks.emit({
           type: ActionType.ChatToolCallStart,
           turnId: turn.id,
@@ -582,34 +586,67 @@ class AcpV1Process implements AcpAdapter {
           displayName: update.title,
           intention: update.title,
         } as StateAction);
-        if (update.status === 'in_progress' || update.status === 'completed' || update.status === 'failed') {
+        if (
+          update.status === 'in_progress'
+          || update.status === 'completed'
+          || update.status === 'failed'
+          || toolInput !== undefined
+        ) {
           this.callbacks.emit({
             type: ActionType.ChatToolCallReady,
             turnId: turn.id,
             toolCallId: update.toolCallId,
             invocationMessage: update.title,
-            toolInput: update.rawInput === undefined ? undefined : JSON.stringify(update.rawInput),
+            toolInput,
             confirmed: ToolCallConfirmationReason.NotNeeded,
           } as StateAction);
         }
         if (update.status === 'completed' || update.status === 'failed') {
-          this.completeTool(turn.id, update.toolCallId, update.status === 'completed', update.rawOutput);
+          this.completeTool(
+            turn.id,
+            update.toolCallId,
+            update.status === 'completed',
+            update.rawOutput,
+            update.content,
+            update.title,
+          );
         }
         break;
       }
       case 'tool_call_update': {
+        if (update.title) {
+          this.toolTitles.set(update.toolCallId, update.title);
+        }
         const title = update.title ?? this.toolTitles.get(update.toolCallId) ?? update.toolCallId;
+        const toolInput = serializeToolInput(update.rawInput);
         if (update.status === 'in_progress') {
           this.callbacks.emit({
             type: ActionType.ChatToolCallReady,
             turnId: turn.id,
             toolCallId: update.toolCallId,
             invocationMessage: title,
-            toolInput: update.rawInput === undefined ? undefined : JSON.stringify(update.rawInput),
+            toolInput,
             confirmed: ToolCallConfirmationReason.NotNeeded,
           } as StateAction);
         } else if (update.status === 'completed' || update.status === 'failed') {
-          this.completeTool(turn.id, update.toolCallId, update.status === 'completed', update.rawOutput);
+          if (toolInput !== undefined) {
+            this.callbacks.emit({
+              type: ActionType.ChatToolCallReady,
+              turnId: turn.id,
+              toolCallId: update.toolCallId,
+              invocationMessage: title,
+              toolInput,
+              confirmed: ToolCallConfirmationReason.NotNeeded,
+            } as StateAction);
+          }
+          this.completeTool(
+            turn.id,
+            update.toolCallId,
+            update.status === 'completed',
+            update.rawOutput,
+            update.content,
+            title,
+          );
         }
         break;
       }
@@ -674,18 +711,139 @@ class AcpV1Process implements AcpAdapter {
     } as StateAction);
   }
 
-  private completeTool(turnId: string, toolCallId: string, success: boolean, rawOutput: unknown): void {
+  private completeTool(
+    turnId: string,
+    toolCallId: string,
+    success: boolean,
+    rawOutput: unknown,
+    acpContent?: unknown[] | null,
+    title?: string,
+  ): void {
+    const { content, summaryText } = this.translateToolCallContent(turnId, toolCallId, acpContent);
+    const rawOutputContent = extractRawOutputText(rawOutput);
+    const fallbackTitle = title && title !== toolCallId ? title : undefined;
+    const pastTenseMessage = summaryText
+      ?? rawOutputContent
+      ?? fallbackTitle
+      ?? (success ? 'Tool completed' : 'Tool failed');
     this.callbacks.emit({
       type: ActionType.ChatToolCallComplete,
       turnId,
       toolCallId,
       result: {
         success,
-        pastTenseMessage: success ? 'Tool completed' : 'Tool failed',
+        pastTenseMessage,
+        ...(content.length > 0 ? { content } : {}),
         ...(rawOutput === undefined ? {} : { structuredContent: { rawOutput } }),
-        ...(success ? {} : { error: { message: 'ACP tool reported failure' } }),
+        ...(success ? {} : { error: { message: summaryText ?? rawOutputContent ?? 'ACP tool reported failure' } }),
       },
     } as StateAction);
+  }
+
+  private translateToolCallContent(
+    turnId: string,
+    toolCallId: string,
+    acpContent: unknown[] | null | undefined,
+  ): { content: ToolResultContent[]; summaryText?: string } {
+    if (!Array.isArray(acpContent) || acpContent.length === 0) {
+      return { content: [] };
+    }
+    const content: ToolResultContent[] = [];
+    const textSummaries: string[] = [];
+
+    for (const item of acpContent) {
+      if (typeof item !== 'object' || item === null) continue;
+      const record = item as Record<string, unknown>;
+      if (record.type === 'diff' && typeof record.path === 'string' && record.path.length > 0) {
+        const fileUri = this.resolveToolFileUri(record.path);
+        if (!fileUri) continue;
+        const oldText = typeof record.oldText === 'string' ? record.oldText : null;
+        const newText = typeof record.newText === 'string' ? record.newText : '';
+        const { added, removed } = computeLineDiffStats(oldText, newText);
+        this.callbacks.recordFileEdit?.({
+          turnId,
+          toolCallId,
+          fileUri,
+          oldText,
+          newText,
+          added,
+          removed,
+        });
+        let urlPath = '/file';
+        try {
+          urlPath = new URL(fileUri).pathname || '/file';
+        } catch {
+          // Keep default path.
+        }
+        const beforeContentUri = `session-db:${urlPath}?${encodeURIComponent(JSON.stringify({
+          toolCallId,
+          fileUri,
+          part: 'before',
+        }))}`;
+        const afterContentUri = `session-db:${urlPath}?${encodeURIComponent(JSON.stringify({
+          toolCallId,
+          fileUri,
+          part: 'after',
+        }))}`;
+        content.push({
+          type: ToolResultContentType.FileEdit,
+          ...(oldText !== null
+            ? {
+                before: {
+                  uri: fileUri,
+                  content: { uri: beforeContentUri },
+                },
+              }
+            : {}),
+          after: {
+            uri: fileUri,
+            content: { uri: afterContentUri },
+          },
+          diff: {
+            added,
+            removed,
+          },
+        });
+      } else if (record.type === 'content' && typeof record.content === 'object' && record.content !== null) {
+        const inner = record.content as Record<string, unknown>;
+        if (inner.type === 'text' && typeof inner.text === 'string' && inner.text.trim().length > 0) {
+          textSummaries.push(inner.text.trim());
+          content.push({
+            type: ToolResultContentType.Text,
+            text: inner.text,
+          });
+        }
+      }
+    }
+
+    const firstLine = textSummaries[0]?.split(/\r?\n/)[0]?.trim();
+    return {
+      content,
+      ...(firstLine ? { summaryText: firstLine } : {}),
+    };
+  }
+
+  private resolveToolFileUri(rawPath: string): string | undefined {
+    if (rawPath.startsWith('file://')) {
+      try {
+        return new URL(rawPath).toString();
+      } catch {
+        return undefined;
+      }
+    }
+    if (isAbsolute(rawPath)) {
+      return pathToFileURL(rawPath).toString();
+    }
+    const baseWorkingDir = this.workingDirectories[0];
+    if (baseWorkingDir) {
+      try {
+        const nativeDir = toNativeWorkingDirectory(baseWorkingDir);
+        return pathToFileURL(resolve(nativeDir, rawPath)).toString();
+      } catch {
+        // Fall through to process cwd resolution.
+      }
+    }
+    return pathToFileURL(resolve(rawPath)).toString();
   }
 
   private publishConfigOptions(configOptions: unknown[] | undefined): void {
@@ -967,3 +1125,88 @@ function delay(ms: number): Promise<void> {
 function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
+
+function serializeToolInput(rawInput: unknown): string | undefined {
+  if (rawInput === undefined) return undefined;
+  if (
+    typeof rawInput === 'object'
+    && rawInput !== null
+    && !Array.isArray(rawInput)
+    && Object.keys(rawInput).length === 0
+  ) {
+    return undefined;
+  }
+  return JSON.stringify(rawInput);
+}
+
+function extractRawOutputText(rawOutput: unknown): string | undefined {
+  if (typeof rawOutput !== 'object' || rawOutput === null || Array.isArray(rawOutput)) {
+    return undefined;
+  }
+  const record = rawOutput as Record<string, unknown>;
+  if (typeof record.content === 'string' && record.content.trim().length > 0) {
+    return record.content.trim().split(/\r?\n/)[0]?.trim();
+  }
+  return undefined;
+}
+
+export function computeLineDiffStats(
+  oldText: string | null | undefined,
+  newText: string | null | undefined,
+): { added: number; removed: number } {
+  const splitLines = (text: string | null | undefined): string[] => {
+    if (!text) return [];
+    const normalized = text.replace(/\r\n/g, '\n');
+    const lines = normalized.split('\n');
+    if (lines.length > 0 && lines[lines.length - 1] === '') {
+      lines.pop();
+    }
+    return lines;
+  };
+  const oldLines = splitLines(oldText);
+  const newLines = splitLines(newText);
+  if (oldLines.length === 0) {
+    return { added: newLines.length, removed: 0 };
+  }
+  if (newLines.length === 0) {
+    return { added: 0, removed: oldLines.length };
+  }
+  let prefix = 0;
+  const minLen = Math.min(oldLines.length, newLines.length);
+  while (prefix < minLen && oldLines[prefix] === newLines[prefix]) {
+    prefix++;
+  }
+  let suffix = 0;
+  while (
+    suffix < minLen - prefix
+    && oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
+  ) {
+    suffix++;
+  }
+  const oldMid = oldLines.slice(prefix, oldLines.length - suffix);
+  const newMid = newLines.slice(prefix, newLines.length - suffix);
+  if (oldMid.length * newMid.length > 40_000) {
+    return { added: newMid.length, removed: oldMid.length };
+  }
+  const dp = new Uint32Array((oldMid.length + 1) * (newMid.length + 1));
+  const width = newMid.length + 1;
+  for (let i = 1; i <= oldMid.length; i++) {
+    const oldLine = oldMid[i - 1];
+    for (let j = 1; j <= newMid.length; j++) {
+      const idx = i * width + j;
+      if (oldLine === newMid[j - 1]) {
+        dp[idx] = dp[(i - 1) * width + (j - 1)]! + 1;
+      } else {
+        const up = dp[(i - 1) * width + j]!;
+        const left = dp[i * width + (j - 1)]!;
+        dp[idx] = up >= left ? up : left;
+      }
+    }
+  }
+  const lcs = dp[oldMid.length * width + newMid.length]!;
+  return {
+    added: Math.max(0, newMid.length - lcs),
+    removed: Math.max(0, oldMid.length - lcs),
+  };
+}
+

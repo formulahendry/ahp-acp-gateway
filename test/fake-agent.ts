@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { readFile, writeFile } from 'node:fs/promises';
 import { Readable, Writable } from 'node:stream';
 import * as acp from '@agentclientprotocol/sdk';
 
@@ -213,6 +214,77 @@ acp.agent({ name: 'ahp-acp-gateway-test-agent' })
         update: {
           sessionUpdate: 'agent_message_chunk',
           content: { type: 'text', text: 'after-tool' },
+        },
+      });
+      sessions.set(ctx.params.sessionId, undefined);
+      return { stopReason: 'end_turn' };
+    }
+
+    if (text.startsWith('diff-edit:')) {
+      const payload = JSON.parse(text.slice('diff-edit:'.length)) as {
+        path: string;
+        newText: string;
+        toolCallId?: string;
+      };
+      const toolCallId = payload.toolCallId ?? `diff-tool-${crypto.randomUUID()}`;
+      let oldText: string | null = null;
+      try {
+        oldText = await readFile(payload.path, 'utf8');
+      } catch {
+        oldText = null;
+      }
+      await writeFile(payload.path, payload.newText, 'utf8');
+      await ctx.client.notify(acp.methods.client.session.update, {
+        sessionId: ctx.params.sessionId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId,
+          title: 'edit',
+          name: 'edit',
+          kind: 'edit',
+          status: 'pending',
+          rawInput: {},
+        },
+      });
+      await ctx.client.notify(acp.methods.client.session.update, {
+        sessionId: ctx.params.sessionId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId,
+          title: payload.path,
+          status: 'in_progress',
+          rawInput: { path: payload.path, newText: payload.newText },
+        },
+      });
+      await ctx.client.notify(acp.methods.client.session.update, {
+        sessionId: ctx.params.sessionId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId,
+          status: 'completed',
+          rawOutput: { ok: true },
+          content: [
+            {
+              type: 'diff',
+              path: payload.path,
+              ...(oldText !== null ? { oldText } : {}),
+              newText: payload.newText,
+            },
+            {
+              type: 'content',
+              content: {
+                type: 'text',
+                text: `Edited ${payload.path}`,
+              },
+            },
+          ],
+        } as any,
+      });
+      await ctx.client.notify(acp.methods.client.session.update, {
+        sessionId: ctx.params.sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'diff-done' },
         },
       });
       sessions.set(ctx.params.sessionId, undefined);

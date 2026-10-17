@@ -1668,6 +1668,122 @@ test('VS Code UI tool confirmation without selectedOptionId and wrapped vscode-a
   assert.equal(await readFile(trackedFile, 'utf8'), 'function add(a, b) { return a + b; }\n');
 });
 
+test('ACP native diff content produces fileEdit tool results, session-db resourceRead, and non-Git folder changesets with discard-changes', async (t) => {
+  const fixture = await startFixture();
+  const nonGitDir = await mkdtemp(join(tmpdir(), 'ahp-acp-non-git-'));
+  const client = await connectClient(fixture.url, 'non-git-client');
+  t.after(async () => {
+    await client.shutdown();
+    await fixture.close();
+    await rm(nonGitDir, { recursive: true, force: true });
+  });
+
+  const existingFile = join(nonGitDir, 'notes.txt');
+  const createdFile = join(nonGitDir, 'created.txt');
+  await writeFile(existingFile, 'alpha\nbeta\n', 'utf8');
+
+  const session = `ahp-session:/non-git-${crypto.randomUUID()}`;
+  const nonGitUri = pathToFileURL(nonGitDir).href;
+  await client.request('createSession', {
+    channel: session,
+    provider: 'fake',
+    workingDirectories: [nonGitUri],
+  });
+  const sessionState = (await client.subscribe(session)).result.snapshot?.state as SessionState;
+  const chat = sessionState.defaultChat!;
+  const chatSub = (await client.subscribe(chat)).subscription;
+
+  // 1. Edit an existing file via ACP diff-edit in a non-Git folder
+  const turn1 = crypto.randomUUID();
+  client.dispatch(
+    chat,
+    userTurn(
+      turn1,
+      `diff-edit:${JSON.stringify({
+        path: existingFile,
+        newText: 'alpha\nbeta-updated\ngamma\n',
+        toolCallId: 'edit-existing-1',
+      })}`,
+    ),
+  );
+  const turn1Actions = await collectUntil(chatSub, ActionType.ChatTurnComplete);
+  const completeAction = turn1Actions.find(
+    (item) => item.action.type === ActionType.ChatToolCallComplete,
+  )?.action as any;
+  assert.ok(completeAction);
+  assert.equal(completeAction.result.pastTenseMessage, `Edited ${existingFile}`);
+  const fileEditItem = completeAction.result.content?.find((c: any) => c.type === 'fileEdit');
+  assert.ok(fileEditItem);
+  assert.equal(fileEditItem.diff.added, 2);
+  assert.equal(fileEditItem.diff.removed, 1);
+  assert.match(fileEditItem.before.content.uri, /^session-db:/);
+  assert.match(fileEditItem.after.content.uri, /^session-db:/);
+
+  // 2. Verify session-db: before and after snapshots can be read via resourceRead
+  const beforeSnap = await client.request('resourceRead', {
+    channel: 'ahp-root://',
+    uri: fileEditItem.before.content.uri,
+  });
+  assert.equal(beforeSnap.data, 'alpha\nbeta\n');
+  const afterSnap = await client.request('resourceRead', {
+    channel: 'ahp-root://',
+    uri: fileEditItem.after.content.uri,
+  });
+  assert.equal(afterSnap.data, 'alpha\nbeta-updated\ngamma\n');
+
+  // 3. Create a brand new file via ACP diff-edit in the same non-Git folder
+  const turn2 = crypto.randomUUID();
+  client.dispatch(
+    chat,
+    userTurn(
+      turn2,
+      `diff-edit:${JSON.stringify({
+        path: createdFile,
+        newText: 'brand new line 1\nbrand new line 2\n',
+        toolCallId: 'create-new-1',
+      })}`,
+    ),
+  );
+  await collectUntil(chatSub, ActionType.ChatTurnComplete);
+
+  // 4. Verify non-Git uncommitted changeset and turn changeset
+  const uncommittedChannel = `${chat}/changeset/uncommitted`;
+  await client.subscribe(uncommittedChannel);
+  await waitForCondition(() => {
+    const cs = fixture.server.store.getChannel(uncommittedChannel) as ChangesetState | undefined;
+    return cs?.status === ChangesetStatus.Ready && (cs.files?.length ?? 0) === 2;
+  });
+  const uncommittedState = fixture.server.store.getChannel(uncommittedChannel) as ChangesetState;
+  assert.equal(uncommittedState.files.length, 2);
+
+  const turn2ChangesetChannel = `${chat}/changeset/turn/${turn2}`;
+  const turn2Changeset = (await client.subscribe(turn2ChangesetChannel)).result.snapshot?.state as ChangesetState;
+  assert.equal(turn2Changeset.files.length, 1);
+  assert.ok(turn2Changeset.files[0]?.id.endsWith('/created.txt'));
+  assert.equal(turn2Changeset.files[0]?.edit.before, undefined);
+
+  // 5. Discard changes on the modified file in the non-Git folder -> restores original content
+  const existingEntry = uncommittedState.files.find((f) => f.id.endsWith('/notes.txt'))!;
+  await client.request('invokeChangesetOperation', {
+    channel: uncommittedChannel,
+    operationId: 'discard-changes',
+    target: { kind: ChangesetOperationTargetKind.Resource, resource: existingEntry.id },
+  });
+  assert.equal(await readFile(existingFile, 'utf8'), 'alpha\nbeta\n');
+
+  // 6. Discard changes on the newly created file in the non-Git folder -> deletes the file
+  const createdEntry = uncommittedState.files.find((f) => f.id.endsWith('/created.txt'))!;
+  await client.request('invokeChangesetOperation', {
+    channel: uncommittedChannel,
+    operationId: 'discard-changes',
+    target: { kind: ChangesetOperationTargetKind.Resource, resource: createdEntry.id },
+  });
+  await assert.rejects(readFile(createdFile, 'utf8'));
+
+  const finalUncommitted = fixture.server.store.getChannel(uncommittedChannel) as ChangesetState;
+  assert.equal(finalUncommitted.files.length, 0);
+});
+
 function storedSession(resource: string, chat: string, now: string) {
   return {
     resource,

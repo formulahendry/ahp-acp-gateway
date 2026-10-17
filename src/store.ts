@@ -56,6 +56,17 @@ export interface AcpBinding {
   configOptionTypes?: Record<string, 'select' | 'boolean'>;
 }
 
+export interface StoredFileEditSnapshot {
+  sessionUri: string;
+  turnId: string;
+  toolCallId: string;
+  fileUri: string;
+  oldText: string | null;
+  newText: string | null;
+  added: number;
+  removed: number;
+}
+
 export class GatewayStore {
   readonly db: DatabaseSync;
   readonly replayLimit: number;
@@ -95,6 +106,20 @@ export class GatewayStore {
         state_json TEXT NOT NULL,
         binding_json TEXT
       );
+      CREATE TABLE IF NOT EXISTS file_edit_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_uri TEXT NOT NULL REFERENCES sessions(resource) ON DELETE CASCADE,
+        turn_id TEXT NOT NULL,
+        tool_call_id TEXT NOT NULL,
+        file_uri TEXT NOT NULL,
+        old_text TEXT,
+        new_text TEXT,
+        added INTEGER NOT NULL DEFAULT 0,
+        removed INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS file_edit_snapshots_session ON file_edit_snapshots(session_uri, id);
+      CREATE INDEX IF NOT EXISTS file_edit_snapshots_lookup ON file_edit_snapshots(session_uri, tool_call_id, file_uri, id);
       INSERT OR IGNORE INTO metadata(key, value) VALUES ('serverSeq', '0');
     `);
     this.migrateTerminalChannelKind();
@@ -441,6 +466,102 @@ export class GatewayStore {
       this.db.prepare(`DELETE FROM sessions WHERE resource=?`).run(uri);
       this.db.prepare(`DELETE FROM channels WHERE uri=?`).run(uri);
     });
+  }
+
+  recordFileEditSnapshot(snapshot: StoredFileEditSnapshot): void {
+    this.db.prepare(
+      `INSERT INTO file_edit_snapshots(session_uri, turn_id, tool_call_id, file_uri, old_text, new_text, added, removed, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      snapshot.sessionUri,
+      snapshot.turnId,
+      snapshot.toolCallId,
+      snapshot.fileUri,
+      snapshot.oldText,
+      snapshot.newText,
+      snapshot.added,
+      snapshot.removed,
+      new Date().toISOString(),
+    );
+  }
+
+  getFileEditSnapshot(
+    sessionUri: string,
+    toolCallId: string,
+    fileUri: string,
+  ): StoredFileEditSnapshot | undefined {
+    const rows = this.db.prepare(
+      `SELECT session_uri, turn_id, tool_call_id, file_uri, old_text, new_text, added, removed
+       FROM file_edit_snapshots
+       WHERE session_uri=? AND tool_call_id=? AND file_uri=?
+       ORDER BY id ASC`,
+    ).all(sessionUri, toolCallId, fileUri) as Array<{
+      session_uri: string;
+      turn_id: string;
+      tool_call_id: string;
+      file_uri: string;
+      old_text: string | null;
+      new_text: string | null;
+      added: number;
+      removed: number;
+    }>;
+    if (rows.length === 0) return undefined;
+    const first = rows[0]!;
+    const last = rows[rows.length - 1]!;
+    return {
+      sessionUri: first.session_uri,
+      turnId: first.turn_id,
+      toolCallId: first.tool_call_id,
+      fileUri: first.file_uri,
+      oldText: first.old_text,
+      newText: last.new_text,
+      added: rows.reduce((sum, row) => sum + row.added, 0),
+      removed: rows.reduce((sum, row) => sum + row.removed, 0),
+    };
+  }
+
+  listFileEditSnapshots(
+    sessionUri: string,
+    turnId?: string,
+  ): StoredFileEditSnapshot[] {
+    const rows = (turnId
+      ? this.db.prepare(
+          `SELECT session_uri, turn_id, tool_call_id, file_uri, old_text, new_text, added, removed
+           FROM file_edit_snapshots
+           WHERE session_uri=? AND turn_id=?
+           ORDER BY id ASC`,
+        ).all(sessionUri, turnId)
+      : this.db.prepare(
+          `SELECT session_uri, turn_id, tool_call_id, file_uri, old_text, new_text, added, removed
+           FROM file_edit_snapshots
+           WHERE session_uri=?
+           ORDER BY id ASC`,
+        ).all(sessionUri)) as Array<{
+      session_uri: string;
+      turn_id: string;
+      tool_call_id: string;
+      file_uri: string;
+      old_text: string | null;
+      new_text: string | null;
+      added: number;
+      removed: number;
+    }>;
+    return rows.map((row) => ({
+      sessionUri: row.session_uri,
+      turnId: row.turn_id,
+      toolCallId: row.tool_call_id,
+      fileUri: row.file_uri,
+      oldText: row.old_text,
+      newText: row.new_text,
+      added: row.added,
+      removed: row.removed,
+    }));
+  }
+
+  deleteFileEditSnapshotsForFile(sessionUri: string, fileUri: string): void {
+    this.db.prepare(
+      `DELETE FROM file_edit_snapshots WHERE session_uri=? AND file_uri=?`,
+    ).run(sessionUri, fileUri);
   }
 
   deleteChat(uri: string): void {
