@@ -2,20 +2,36 @@ import { DatabaseSync } from 'node:sqlite';
 import {
   ActionType,
   ResponsePartKind,
+  changesetReducer,
   chatReducer,
+  resourceWatchReducer,
   rootReducer,
   sessionReducer,
   terminalReducer,
   type ActionEnvelope,
+  type ChangesetState,
   type ChatState,
+  type ResourceWatchState,
   type RootState,
   type SessionState,
   type StateAction,
   type TerminalState,
 } from '@microsoft/agent-host-protocol';
 
-export type ChannelState = RootState | SessionState | ChatState | TerminalState;
-export type ChannelKind = 'root' | 'session' | 'chat' | 'terminal';
+export type ChannelState =
+  | RootState
+  | SessionState
+  | ChatState
+  | TerminalState
+  | ChangesetState
+  | ResourceWatchState;
+export type ChannelKind =
+  | 'root'
+  | 'session'
+  | 'chat'
+  | 'terminal'
+  | 'changeset'
+  | 'resourceWatch';
 
 export interface StoredSession {
   resource: string;
@@ -37,6 +53,7 @@ export interface AcpBinding {
   acpSessionId?: string;
   loadSupported?: boolean;
   contextReset?: boolean;
+  configOptionTypes?: Record<string, 'select' | 'boolean'>;
 }
 
 export class GatewayStore {
@@ -55,7 +72,7 @@ export class GatewayStore {
       );
       CREATE TABLE IF NOT EXISTS channels (
         uri TEXT PRIMARY KEY,
-        kind TEXT NOT NULL CHECK (kind IN ('root', 'session', 'chat', 'terminal')),
+        kind TEXT NOT NULL CHECK (kind IN ('root', 'session', 'chat', 'terminal', 'changeset', 'resourceWatch')),
         state_json TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS actions (
@@ -227,7 +244,29 @@ export class GatewayStore {
   }
 
   clearTerminals(): void {
-    this.db.prepare(`DELETE FROM channels WHERE kind='terminal'`).run();
+    this.db.prepare(`DELETE FROM channels WHERE kind IN ('terminal', 'resourceWatch')`).run();
+  }
+
+  putChannel(uri: string, kind: ChannelKind, state: ChannelState): void {
+    this.db.prepare(
+      `INSERT INTO channels(uri, kind, state_json) VALUES (?, ?, ?)
+       ON CONFLICT(uri) DO UPDATE SET kind=excluded.kind, state_json=excluded.state_json`,
+    ).run(uri, kind, JSON.stringify(state));
+  }
+
+  deleteChannel(uri: string): void {
+    this.db.prepare(`DELETE FROM channels WHERE uri=?`).run(uri);
+  }
+
+  listChannelsByKind(kind: ChannelKind): Array<{ uri: string; state: ChannelState }> {
+    const rows = this.db.prepare(`SELECT uri, state_json FROM channels WHERE kind=?`).all(kind) as Array<{
+      uri: string;
+      state_json: string;
+    }>;
+    return rows.map((row) => ({
+      uri: row.uri,
+      state: JSON.parse(row.state_json) as ChannelState,
+    }));
   }
 
   createTerminal(
@@ -389,6 +428,13 @@ export class GatewayStore {
 
   deleteSession(uri: string): void {
     this.transaction(() => {
+      const chatRows = this.db.prepare(`SELECT resource FROM chats WHERE session_uri=?`).all(uri) as Array<{
+        resource: string;
+      }>;
+      for (const chatRow of chatRows) {
+        this.db.prepare(`DELETE FROM channels WHERE uri LIKE ?`).run(`${chatRow.resource}/changeset/%`);
+      }
+      this.db.prepare(`DELETE FROM channels WHERE uri LIKE ?`).run(`${uri}/changeset/%`);
       this.db.prepare(
         `DELETE FROM channels WHERE uri IN (SELECT resource FROM chats WHERE session_uri=?)`,
       ).run(uri);
@@ -399,6 +445,7 @@ export class GatewayStore {
 
   deleteChat(uri: string): void {
     this.transaction(() => {
+      this.db.prepare(`DELETE FROM channels WHERE uri LIKE ?`).run(`${uri}/changeset/%`);
       this.db.prepare(`DELETE FROM chats WHERE resource=?`).run(uri);
       this.db.prepare(`DELETE FROM channels WHERE uri=?`).run(uri);
     });
@@ -474,10 +521,24 @@ export class GatewayStore {
     for (const row of rows) {
       const state = JSON.parse(row.state_json) as ChatState;
       if (!state.activeTurn) continue;
+      const parsedStartedAt = typeof state.activeTurn.startedAt === 'string'
+        ? Date.parse(state.activeTurn.startedAt)
+        : Number.NaN;
+      if (!Number.isFinite(parsedStartedAt)) {
+        state.activeTurn.startedAt = new Date().toISOString();
+        const sanitizedJson = JSON.stringify(state);
+        this.transaction(() => {
+          this.db.prepare(`UPDATE channels SET state_json=? WHERE uri=?`).run(sanitizedJson, row.resource);
+          this.db.prepare(`UPDATE chats SET state_json=? WHERE resource=?`).run(sanitizedJson, row.resource);
+        });
+      }
+      const duration = Number.isFinite(parsedStartedAt)
+        ? Math.max(0, Date.now() - parsedStartedAt)
+        : 0;
       repaired.push(this.apply(row.resource, {
         type: ActionType.ChatError,
         turnId: state.activeTurn.id,
-        duration: Math.max(0, Date.now() - Date.parse(state.activeTurn.startedAt)),
+        duration,
         part: {
           kind: ResponsePartKind.Error,
           error: {
@@ -525,13 +586,20 @@ export class GatewayStore {
     const row = this.db.prepare(
       `SELECT sql FROM sqlite_master WHERE type='table' AND name='channels'`,
     ).get() as { sql: string } | undefined;
-    if (!row || row.sql.includes("'terminal'")) return;
+    if (
+      !row
+      || (row.sql.includes("'terminal'")
+        && row.sql.includes("'changeset'")
+        && row.sql.includes("'resourceWatch'"))
+    ) {
+      return;
+    }
     this.db.exec(`
       BEGIN IMMEDIATE;
       ALTER TABLE channels RENAME TO channels_legacy;
       CREATE TABLE channels (
         uri TEXT PRIMARY KEY,
-        kind TEXT NOT NULL CHECK (kind IN ('root', 'session', 'chat', 'terminal')),
+        kind TEXT NOT NULL CHECK (kind IN ('root', 'session', 'chat', 'terminal', 'changeset', 'resourceWatch')),
         state_json TEXT NOT NULL
       );
       INSERT INTO channels(uri, kind, state_json)
@@ -547,5 +615,7 @@ function reduce(kind: ChannelKind, state: ChannelState, action: StateAction): Ch
   if (kind === 'session') return sessionReducer(state as SessionState, action as never);
   if (kind === 'chat') return chatReducer(state as ChatState, action as never);
   if (kind === 'terminal') return terminalReducer(state as TerminalState, action as never);
+  if (kind === 'changeset') return changesetReducer(state as ChangesetState, action as never);
+  if (kind === 'resourceWatch') return resourceWatchReducer(state as ResourceWatchState, action as never);
   throw new Error(`Unsupported channel kind ${kind}`);
 }

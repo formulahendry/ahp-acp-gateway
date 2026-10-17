@@ -73,11 +73,15 @@ acp.agent({ name: 'ahp-acp-gateway-test-agent' })
   })
   .onRequest(acp.methods.agent.session.load, (ctx) => {
     sessions.set(ctx.params.sessionId, undefined);
-    sessionConfigValues.set(ctx.params.sessionId, {
-      model: 'fake-model',
-      mode: 'interactive',
-    });
-    return {};
+    if (!sessionConfigValues.has(ctx.params.sessionId)) {
+      sessionConfigValues.set(ctx.params.sessionId, {
+        model: 'fake-model',
+        mode: 'interactive',
+      });
+    }
+    return {
+      configOptions: configOptions(ctx.params.sessionId),
+    } as any;
   })
   .onRequest(acp.methods.agent.session.setConfigOption, (ctx) => {
     const values = sessionConfigValues.get(ctx.params.sessionId) ?? {};
@@ -173,6 +177,38 @@ acp.agent({ name: 'ahp-acp-gateway-test-agent' })
         content: { type: 'text', text: 'thinking' },
       },
     });
+
+    if (text === 'interleaved-tools') {
+      await ctx.client.notify(acp.methods.client.session.update, {
+        sessionId: ctx.params.sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'before-tool' },
+        },
+      });
+      await ctx.client.notify(acp.methods.client.session.update, {
+        sessionId: ctx.params.sessionId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'tool-1',
+          title: 'Write file',
+          name: 'write_file',
+          kind: 'edit',
+          status: 'completed',
+          rawInput: { path: 'a.txt' },
+          rawOutput: { ok: true },
+        },
+      });
+      await ctx.client.notify(acp.methods.client.session.update, {
+        sessionId: ctx.params.sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'after-tool' },
+        },
+      });
+      sessions.set(ctx.params.sessionId, undefined);
+      return { stopReason: 'end_turn' };
+    }
 
     if (text === 'usage') {
       await ctx.client.notify(acp.methods.client.session.update, {

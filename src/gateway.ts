@@ -1,14 +1,20 @@
 import { timingSafeEqual } from 'node:crypto';
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { lstat, readFile, readdir, realpath, stat } from 'node:fs/promises';
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { watch as watchFs, type FSWatcher } from 'node:fs';
+import { lstat, readFile, readdir, realpath, rm, stat } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
-import { extname, isAbsolute, relative } from 'node:path';
+import { extname, isAbsolute, join, relative, resolve as resolvePath } from 'node:path';
+import { promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
 import {
   ActionType,
+  ChangesetOperationScope,
+  ChangesetOperationStatus,
+  ChangesetStatus,
   ChatOriginKind,
   ConfirmationOptionKind,
   MessageKind,
+  ResourceChangeType,
   SUPPORTED_PROTOCOL_VERSIONS,
   SessionLifecycle,
   SessionStatus,
@@ -18,7 +24,13 @@ import {
   ToolCallStatus,
   negotiateProtocolVersion,
   type ActionEnvelope,
+  type Changeset,
+  type ChangesetFile,
+  type ChangesetOperation,
+  type ChangesetState,
+  type ChangesSummary,
   type ChatState,
+  type ResourceWatchState,
   type SessionState,
   type StateAction,
 } from '@microsoft/agent-host-protocol';
@@ -34,6 +46,8 @@ import {
 import { GatewayStore, type AcpBinding, type StoredSession } from './store.js';
 import { VERSION } from './version.js';
 
+const execFileAsync = promisify(execFile);
+
 interface JsonRpcRequest {
   jsonrpc: '2.0';
   id?: string | number | null;
@@ -48,6 +62,13 @@ interface Connection {
   subscriptions: Set<string>;
 }
 
+interface ActiveResourceWatcher {
+  watcher: FSWatcher;
+  timer?: NodeJS.Timeout | undefined;
+  pendingPaths: Set<string>;
+  knownExists: Map<string, boolean>;
+}
+
 export class GatewayServer {
   readonly config: GatewayConfig;
   readonly store: GatewayStore;
@@ -58,6 +79,7 @@ export class GatewayServer {
     schema: { type: 'object'; properties: Record<string, Record<string, unknown>> };
     values: Record<string, unknown>;
   }>();
+  private readonly resourceWatchers = new Map<string, ActiveResourceWatcher>();
   private readonly adapterFactory: AcpAdapterFactory;
   private readonly connections = new Set<Connection>();
   private readonly httpServer: Server;
@@ -73,6 +95,13 @@ export class GatewayServer {
       agents: config.providers.map(providerInfo),
       activeSessions: this.store.sessionCount(),
       terminals: [],
+      config: {
+        schema: {
+          type: 'object',
+          properties: {},
+        },
+        values: {},
+      },
       _meta: {
         product: 'AHP-ACP Gateway',
         acpVersion: 1,
@@ -80,13 +109,25 @@ export class GatewayServer {
           'resourceWrites',
           'terminalPty',
           'terminalCommandDetection',
-          'changesets',
           'attachments',
           'multipleChats',
           'acpV2',
         ],
       },
     });
+    const currentRoot = this.store.getChannel('ahp-root://') as any;
+    if (currentRoot && !currentRoot.config) {
+      this.store.putChannel('ahp-root://', 'root', {
+        ...currentRoot,
+        config: {
+          schema: {
+            type: 'object',
+            properties: {},
+          },
+          values: {},
+        },
+      });
+    }
     this.store.repairInterruptedTurns();
     this.httpServer = createServer((request, response) => {
       if (request.url === '/healthz') {
@@ -152,6 +193,11 @@ export class GatewayServer {
       });
     });
     for (const connection of this.connections) connection.socket.close(1001, 'Server shutting down');
+    for (const watcher of this.resourceWatchers.values()) {
+      if (watcher.timer) clearTimeout(watcher.timer);
+      watcher.watcher.close();
+    }
+    this.resourceWatchers.clear();
     await Promise.allSettled(
       [...this.terminals.values()].map((terminal) => stopTerminalProcess(terminal)),
     );
@@ -195,10 +241,44 @@ export class GatewayServer {
     });
     socket.on('close', () => {
       this.connections.delete(connection);
+      this.onConnectionClosed(connection);
     });
     socket.on('error', () => {
       this.connections.delete(connection);
+      this.onConnectionClosed(connection);
     });
+  }
+
+  private onConnectionClosed(connection: Connection): void {
+    if (this.closing) return;
+    if (connection.clientId) {
+      this.reconcileActiveClientSessions(connection.clientId);
+    }
+    for (const channel of connection.subscriptions) {
+      this.maybeCleanupResourceWatch(channel);
+    }
+  }
+
+  private reconcileActiveClientSessions(clientId: string): void {
+    const activeSubscriptions = new Set<string>();
+    for (const conn of this.connections) {
+      if (conn.initialized && conn.clientId === clientId && conn.socket.readyState === WebSocket.OPEN) {
+        for (const sub of conn.subscriptions) activeSubscriptions.add(sub);
+      }
+    }
+    for (const session of this.store.listSessions(10_000, 0)) {
+      const isActive = (session.state.activeClients ?? []).some((client) => client.clientId === clientId);
+      if (!isActive) continue;
+      const stillSubscribed = activeSubscriptions.has(session.resource)
+        || session.state.chats.some((chat) => activeSubscriptions.has(chat.resource));
+      if (!stillSubscribed) {
+        const envelope = this.store.apply(session.resource, {
+          type: ActionType.SessionActiveClientRemoved,
+          clientId,
+        } as StateAction);
+        this.broadcastAction(envelope);
+      }
+    }
   }
 
   private async onMessage(connection: Connection, data: RawData): Promise<void> {
@@ -236,9 +316,15 @@ export class GatewayServer {
         return null;
       case 'subscribe':
         return this.subscribe(connection, params);
-      case 'unsubscribe':
-        connection.subscriptions.delete(requireString(params.channel, 'channel'));
+      case 'unsubscribe': {
+        const channel = requireString(params.channel, 'channel');
+        connection.subscriptions.delete(channel);
+        if (connection.clientId) {
+          this.reconcileActiveClientSessions(connection.clientId);
+        }
+        this.maybeCleanupResourceWatch(channel);
         return null;
+      }
       case 'listSessions':
         this.requireRoot(params);
         return this.listSessions(params);
@@ -250,6 +336,10 @@ export class GatewayServer {
         return this.resourceList(params);
       case 'resourceResolve':
         return this.resourceResolve(params);
+      case 'createResourceWatch':
+        return this.createResourceWatch(params);
+      case 'invokeChangesetOperation':
+        return this.invokeChangesetOperation(params);
       case 'completions':
         return this.completions(params);
       case 'createTerminal':
@@ -337,14 +427,21 @@ export class GatewayServer {
     };
   }
 
-  private subscribe(connection: Connection, params: Record<string, unknown>): unknown {
+  private async subscribe(connection: Connection, params: Record<string, unknown>): Promise<unknown> {
     const channel = requireString(params.channel, 'channel');
     if (params.flowControl !== undefined) {
       throw new RpcError(-32602, 'Windowed subscriptions are not implemented');
     }
+    const parsedChangeset = this.parseChangesetChannelWithStore(channel);
+    if (parsedChangeset) {
+      await this.tryEnsureChangesetChannel(channel);
+    }
     const snapshot = this.store.getSnapshot(channel);
     if (!snapshot) throw new RpcError(-32001, `Unknown channel ${channel}`);
     connection.subscriptions.add(channel);
+    if (this.store.getChannelKind(channel) === 'resourceWatch') {
+      this.ensureResourceWatcherStarted(channel);
+    }
     return { channel, snapshot };
   }
 
@@ -408,6 +505,9 @@ export class GatewayServer {
       && requestedEncoding !== 'base64'
     ) {
       throw new RpcError(-32602, 'encoding must be utf-8 or base64');
+    }
+    if (uri.startsWith('git-blob:')) {
+      return this.readGitBlobResource(uri, requestedEncoding);
     }
     const path = resourcePath(uri);
     try {
@@ -576,6 +676,8 @@ export class GatewayServer {
       : undefined;
     const now = new Date().toISOString();
     const chatResource = `ahp-chat:/${crypto.randomUUID()}`;
+    const chatChangesets = workingDirectories ? buildChatChangesets(chatResource, resource) : undefined;
+    const sessionChangesets = workingDirectories ? buildSessionChangesets(resource) : undefined;
     const chat: ChatState = {
       resource: chatResource,
       title: 'Chat',
@@ -583,6 +685,7 @@ export class GatewayServer {
       modifiedAt: now,
       origin: { kind: ChatOriginKind.User },
       ...(workingDirectories ? { workingDirectories } : {}),
+      ...(chatChangesets ? { changesets: chatChangesets } : {}),
       turns: [],
     };
     const sessionState: SessionState = {
@@ -591,6 +694,7 @@ export class GatewayServer {
       status: SessionStatus.Idle,
       lifecycle: SessionLifecycle.Creating,
       ...(workingDirectories ? { workingDirectories } : {}),
+      ...(sessionChangesets ? { changesets: sessionChangesets } : {}),
       chats: [chatSummary(chat)],
       defaultChat: chatResource,
       activeClients: [],
@@ -616,6 +720,9 @@ export class GatewayServer {
       state: chat,
       binding: { provider: provider.id },
     });
+    if (workingDirectories) {
+      this.ensureStaticChangesets(resource, chatResource);
+    }
     this.broadcastAction(rootEnvelope);
     this.broadcast('ahp-root://', 'root/sessionAdded', {
       channel: 'ahp-root://',
@@ -630,6 +737,10 @@ export class GatewayServer {
             await adapter.setConfigOption(configId, value);
           }
         }
+      }
+      this.markSessionReady(resource);
+      if (workingDirectories) {
+        await this.refreshSessionChangesets(resource);
       }
       return null;
     } catch (error) {
@@ -710,12 +821,30 @@ export class GatewayServer {
       this.broadcastAction(this.store.reject(channel, action, origin, 'Action is server-only'));
       return;
     }
-    if (this.store.getSession(channel) && action.type === ActionType.SessionConfigChanged) {
-      await this.dispatchSessionConfig(channel, action, origin);
+    if (channel === 'ahp-root://') {
+      if (action.type !== ActionType.RootConfigChanged) {
+        this.broadcastAction(this.store.reject(channel, action, origin, 'Unsupported root action'));
+        return;
+      }
+      if (!action.config || typeof action.config !== 'object' || Array.isArray(action.config)) {
+        this.broadcastAction(this.store.reject(channel, action, origin, 'config must be an object'));
+        return;
+      }
+      const accepted = this.store.apply(channel, action, origin);
+      this.broadcastAction(accepted);
+      return;
+    }
+    const session = this.store.getSession(channel);
+    if (session) {
+      await this.dispatchSessionAction(channel, session, action, origin);
       return;
     }
     if (isTerminalChannel(channel)) {
       this.dispatchTerminalAction(channel, action, origin);
+      return;
+    }
+    if (this.store.getChannelKind(channel) === 'changeset') {
+      this.dispatchChangesetAction(channel, action, origin);
       return;
     }
     const chat = this.store.getChat(channel);
@@ -725,7 +854,19 @@ export class GatewayServer {
     }
     switch (action.type) {
       case ActionType.ChatTurnStarted: {
-        if (action.message.origin.kind !== MessageKind.User) {
+        if (typeof action.turnId !== 'string' || action.turnId.length === 0) {
+          this.broadcastAction(this.store.reject(channel, action, origin, 'turnId must be a non-empty string'));
+          return;
+        }
+        if (typeof action.startedAt !== 'string' || !Number.isFinite(Date.parse(action.startedAt))) {
+          this.broadcastAction(this.store.reject(channel, action, origin, 'startedAt must be a valid ISO timestamp'));
+          return;
+        }
+        if (!action.message || typeof action.message !== 'object' || typeof action.message.text !== 'string') {
+          this.broadcastAction(this.store.reject(channel, action, origin, 'message.text must be a string'));
+          return;
+        }
+        if (action.message.origin?.kind !== MessageKind.User) {
           this.broadcastAction(this.store.reject(channel, action, origin, 'Only user messages may start a turn'));
           return;
         }
@@ -748,6 +889,7 @@ export class GatewayServer {
         const accepted = this.store.apply(channel, action, origin);
         this.broadcastAction(accepted);
         this.syncChatSummary(chat.session, channel);
+        void this.refreshSessionChangesets(chat.session, action.turnId);
         const adapter = this.getAdapter(channel);
         void this.cleanupCancelledAdapter(channel, adapter);
         return;
@@ -779,6 +921,15 @@ export class GatewayServer {
         );
         return;
       }
+      case ActionType.ChatIsReadChanged:
+      case ActionType.ChatIsArchivedChanged:
+      case ActionType.ChatDraftChanged:
+      case ActionType.ChatTruncated: {
+        const accepted = this.store.apply(channel, action, origin);
+        this.broadcastAction(accepted);
+        this.syncChatSummary(chat.session, channel);
+        return;
+      }
       default: {
         const accepted = this.store.apply(channel, action, origin);
         this.broadcastAction(accepted);
@@ -806,6 +957,17 @@ export class GatewayServer {
           const envelope = this.store.apply(chatResource, action);
           this.broadcastAction(envelope);
           this.syncChatSummary(chat.session, chatResource);
+          if (
+            action.type === ActionType.ChatToolCallComplete
+            || action.type === ActionType.ChatTurnComplete
+            || action.type === ActionType.ChatTurnCancelled
+            || action.type === ActionType.ChatError
+          ) {
+            const turnId = 'turnId' in action && typeof action.turnId === 'string'
+              ? action.turnId
+              : undefined;
+            void this.refreshSessionChangesets(chat.session, turnId);
+          }
         },
         bindingChanged: (nextBinding) => {
           this.store.updateBinding(chatResource, nextBinding);
@@ -825,27 +987,32 @@ export class GatewayServer {
           }
         },
         ready: () => {
+          // Handled explicitly in createSession after initial config is applied,
+          // or immediately if the session was restored.
           const current = this.store.getSession(chat.session);
-          if (!current || current.state.lifecycle === SessionLifecycle.Ready) return;
-          const envelope = this.store.apply(chat.session, {
-            type: ActionType.SessionReady,
-          } as StateAction);
-          this.broadcastAction(envelope);
+          if (!current || current.state.lifecycle !== SessionLifecycle.Creating) return;
         },
         modelsChanged: (models) => {
           const root = this.store.getChannel('ahp-root://') as any;
-          const agents = root.agents.map((agent: any) =>
-            agent.provider === provider.id
-              ? {
-                  ...agent,
-                  models: models.map((model) => ({
-                    id: model.id,
-                    provider: provider.id,
-                    name: model.name,
-                    ...(model.description === undefined ? {} : { _meta: { description: model.description, ...model._meta } }),
-                  })),
-                }
-              : agent);
+          const agents = root.agents.map((agent: any) => {
+            if (agent.provider !== provider.id) return agent;
+            const incoming = models.map((model) => ({
+              id: model.id,
+              provider: provider.id,
+              name: model.name,
+              ...(model.description === undefined ? {} : { _meta: { description: model.description, ...model._meta } }),
+            }));
+            const merged = [...incoming];
+            for (const existingModel of agent.models ?? []) {
+              if (existingModel.id !== 'default' && !merged.some((item) => item.id === existingModel.id)) {
+                merged.push(existingModel);
+              }
+            }
+            return {
+              ...agent,
+              models: merged.length > 0 ? merged : agent.models,
+            };
+          });
           if (JSON.stringify(root.agents) === JSON.stringify(agents)) return;
           const envelope = this.store.apply('ahp-root://', {
             type: ActionType.RootAgentsChanged,
@@ -932,6 +1099,496 @@ export class GatewayServer {
     if (this.adapters.get(chatResource) === adapter) this.adapters.delete(chatResource);
   }
 
+  private markSessionReady(sessionResource: string): void {
+    const current = this.store.getSession(sessionResource);
+    if (!current || current.state.lifecycle === SessionLifecycle.Ready) return;
+    const envelope = this.store.apply(sessionResource, {
+      type: ActionType.SessionReady,
+    } as StateAction);
+    this.broadcastAction(envelope);
+  }
+
+  private async dispatchSessionAction(
+    sessionResource: string,
+    session: StoredSession,
+    action: any,
+    origin: { clientId: string; clientSeq: number },
+  ): Promise<void> {
+    switch (action.type) {
+      case ActionType.SessionConfigChanged:
+        await this.dispatchSessionConfig(sessionResource, action, origin);
+        return;
+      case ActionType.SessionTitleChanged: {
+        if (typeof action.title !== 'string') {
+          this.broadcastAction(this.store.reject(sessionResource, action, origin, 'title must be a string'));
+          return;
+        }
+        const accepted = this.store.apply(sessionResource, action, origin);
+        this.broadcastAction(accepted);
+        this.broadcast('ahp-root://', 'root/sessionSummaryChanged', {
+          channel: 'ahp-root://',
+          session: sessionResource,
+          changes: {
+            title: action.title,
+            modifiedAt: new Date().toISOString(),
+          },
+        });
+        return;
+      }
+      case ActionType.SessionIsReadChanged:
+      case ActionType.SessionIsArchivedChanged: {
+        if (
+          action.type === ActionType.SessionIsReadChanged
+          && typeof action.isRead !== 'boolean'
+        ) {
+          this.broadcastAction(this.store.reject(sessionResource, action, origin, 'isRead must be a boolean'));
+          return;
+        }
+        if (
+          action.type === ActionType.SessionIsArchivedChanged
+          && typeof action.isArchived !== 'boolean'
+        ) {
+          this.broadcastAction(this.store.reject(sessionResource, action, origin, 'isArchived must be a boolean'));
+          return;
+        }
+        const accepted = this.store.apply(sessionResource, action, origin);
+        this.broadcastAction(accepted);
+        const updated = this.store.getSession(sessionResource);
+        if (updated) {
+          this.broadcast('ahp-root://', 'root/sessionSummaryChanged', {
+            channel: 'ahp-root://',
+            session: sessionResource,
+            changes: {
+              status: updated.state.status,
+              modifiedAt: new Date().toISOString(),
+            },
+          });
+        }
+        return;
+      }
+      case ActionType.SessionActiveClientSet: {
+        if (
+          !action.activeClient
+          || typeof action.activeClient !== 'object'
+          || typeof action.activeClient.clientId !== 'string'
+        ) {
+          this.broadcastAction(this.store.reject(sessionResource, action, origin, 'activeClient.clientId must be a string'));
+          return;
+        }
+        if (action.activeClient.clientId !== origin.clientId) {
+          this.broadcastAction(this.store.reject(sessionResource, action, origin, 'activeClient.clientId must match connection clientId'));
+          return;
+        }
+        const accepted = this.store.apply(sessionResource, action, origin);
+        this.broadcastAction(accepted);
+        return;
+      }
+      case ActionType.SessionActiveClientRemoved: {
+        if (typeof action.clientId !== 'string') {
+          this.broadcastAction(this.store.reject(sessionResource, action, origin, 'clientId must be a string'));
+          return;
+        }
+        if (action.clientId !== origin.clientId) {
+          this.broadcastAction(this.store.reject(sessionResource, action, origin, 'clientId must match connection clientId'));
+          return;
+        }
+        const accepted = this.store.apply(sessionResource, action, origin);
+        this.broadcastAction(accepted);
+        return;
+      }
+      default:
+        this.broadcastAction(this.store.reject(sessionResource, action, origin, 'Unsupported session action'));
+    }
+  }
+
+  private dispatchChangesetAction(
+    channel: string,
+    action: any,
+    origin: { clientId: string; clientSeq: number },
+  ): void {
+    if (action.type !== ActionType.ChangesetFilesReviewChanged) {
+      this.broadcastAction(this.store.reject(channel, action, origin, 'Unsupported changeset action'));
+      return;
+    }
+    if (!Array.isArray(action.files) || typeof action.reviewed !== 'boolean') {
+      this.broadcastAction(this.store.reject(channel, action, origin, 'files array and reviewed boolean are required'));
+      return;
+    }
+    const accepted = this.store.apply(channel, action, origin);
+    this.broadcastAction(accepted);
+  }
+
+  private ensureStaticChangesets(sessionResource: string, chatResource: string): void {
+    const uncommittedUri = `${chatResource}/changeset/uncommitted`;
+    const sessionChangesetUri = `${sessionResource}/changeset/session`;
+    for (const uri of [uncommittedUri, sessionChangesetUri]) {
+      if (!this.store.getChannel(uri)) {
+        const initial: ChangesetState = {
+          status: ChangesetStatus.Ready,
+          files: [],
+          operations: uri === uncommittedUri ? buildDiscardChangesOperations([]) : [],
+        };
+        this.store.putChannel(uri, 'changeset', initial);
+      }
+    }
+  }
+
+  private parseChangesetChannelWithStore(channel: string): ParsedChangesetChannel | undefined {
+    const parsed = parseChangesetChannel(channel);
+    if (!parsed) return undefined;
+    if (parsed.ownerUri.startsWith('ahp-chat:')) {
+      const chat = this.store.getChat(parsed.ownerUri);
+      if (!chat) return undefined;
+      return {
+        ...parsed,
+        sessionUri: chat.session,
+      };
+    }
+    return parsed;
+  }
+
+  private async tryEnsureChangesetChannel(channel: string): Promise<boolean> {
+    const parsed = this.parseChangesetChannelWithStore(channel);
+    if (!parsed) return false;
+    const session = this.store.getSession(parsed.sessionUri);
+    if (!session) return false;
+    const chatResource = session.state.defaultChat ?? session.state.chats[0]?.resource;
+    if (parsed.ownerUri !== parsed.sessionUri && parsed.ownerUri !== chatResource) {
+      return false;
+    }
+    if (!this.store.getChannel(channel)) {
+      this.store.putChannel(channel, 'changeset', {
+        status: ChangesetStatus.Computing,
+        files: [],
+        operations: [],
+      });
+    }
+    await this.refreshSessionChangesets(parsed.sessionUri, parsed.turnId);
+    return true;
+  }
+
+  private async refreshSessionChangesets(sessionResource: string, turnId?: string): Promise<void> {
+    const session = this.store.getSession(sessionResource);
+    if (!session) return;
+    const workingDirUri = session.state.workingDirectories?.[0];
+    const chatResource = session.state.defaultChat ?? session.state.chats[0]?.resource;
+    if (!workingDirUri || !chatResource) return;
+
+    this.ensureStaticChangesets(sessionResource, chatResource);
+    const cwd = resourcePath(workingDirUri);
+    const { files, summary: changesSummary } = await computeWorkingDirectoryChanges(cwd, sessionResource);
+
+    const uncommittedUri = `${chatResource}/changeset/uncommitted`;
+    const sessionChangesetUri = `${sessionResource}/changeset/session`;
+    this.updateChangesetChannel(uncommittedUri, files, buildDiscardChangesOperations(files));
+    this.updateChangesetChannel(sessionChangesetUri, files, []);
+    if (turnId) {
+      const turnUri = `${chatResource}/changeset/turn/${turnId}`;
+      if (!this.store.getChannel(turnUri)) {
+        this.store.putChannel(turnUri, 'changeset', {
+          status: ChangesetStatus.Computing,
+          files: [],
+          operations: [],
+        });
+      }
+      this.updateChangesetChannel(turnUri, files, []);
+    }
+
+    const latestSession = this.store.getSession(sessionResource);
+    const currentChatSummary = latestSession?.state.chats.find((item) => item.resource === chatResource);
+    if (JSON.stringify(currentChatSummary?.changes) !== JSON.stringify(changesSummary)) {
+      const modifiedAt = new Date().toISOString();
+      const envelope = this.store.apply(sessionResource, {
+        type: ActionType.SessionChatUpdated,
+        chat: chatResource,
+        changes: {
+          changes: changesSummary,
+          modifiedAt,
+        },
+      } as StateAction);
+      this.broadcastAction(envelope);
+      const updatedSession = this.store.getSession(sessionResource);
+      if (updatedSession) {
+        this.broadcast('ahp-root://', 'root/sessionSummaryChanged', {
+          channel: 'ahp-root://',
+          session: sessionResource,
+          changes: {
+            changes: changesSummary,
+            modifiedAt,
+            chats: updatedSession.state.chats.map((item) => ({
+              resource: item.resource,
+              title: item.title,
+              status: item.status,
+              modifiedAt: item.modifiedAt,
+              ...(item.changes === undefined ? {} : { changes: item.changes }),
+            })),
+          },
+        });
+      }
+    }
+  }
+
+  private updateChangesetChannel(
+    changesetUri: string,
+    files: ChangesetFile[],
+    operations: ChangesetOperation[],
+  ): void {
+    const existing = this.store.getChannel(changesetUri) as ChangesetState | undefined;
+    if (!existing) return;
+    const reviewedById = new Map<string, boolean>();
+    for (const file of existing.files ?? []) {
+      if (typeof file.reviewed === 'boolean') {
+        reviewedById.set(file.id, file.reviewed);
+      }
+    }
+    const mergedFiles: ChangesetFile[] = files.map((file) => {
+      const reviewed = reviewedById.get(file.id);
+      return reviewed === undefined ? file : { ...file, reviewed };
+    });
+    if (JSON.stringify(existing.files) !== JSON.stringify(mergedFiles)) {
+      const envelope = this.store.apply(changesetUri, {
+        type: ActionType.ChangesetContentChanged,
+        files: mergedFiles,
+      } as StateAction);
+      this.broadcastAction(envelope);
+    }
+    const afterContent = this.store.getChannel(changesetUri) as ChangesetState;
+    if (JSON.stringify(afterContent.operations ?? []) !== JSON.stringify(operations)) {
+      const envelope = this.store.apply(changesetUri, {
+        type: ActionType.ChangesetOperationsChanged,
+        operations,
+      } as StateAction);
+      this.broadcastAction(envelope);
+    }
+    const afterOps = this.store.getChannel(changesetUri) as ChangesetState;
+    if (afterOps.status !== ChangesetStatus.Ready) {
+      const envelope = this.store.apply(changesetUri, {
+        type: ActionType.ChangesetStatusChanged,
+        status: ChangesetStatus.Ready,
+      } as StateAction);
+      this.broadcastAction(envelope);
+    }
+  }
+
+  private async invokeChangesetOperation(params: Record<string, unknown>): Promise<null> {
+    const channel = requireString(params.channel, 'channel');
+    const operationId = requireString(params.operationId, 'operationId');
+    const parsed = this.parseChangesetChannelWithStore(channel);
+    if (!parsed || !this.store.getChannel(channel)) {
+      throw new RpcError(-32001, `Unknown changeset ${channel}`);
+    }
+    const session = this.store.getSession(parsed.sessionUri);
+    const workingDirUri = session?.state.workingDirectories?.[0];
+    if (!session || !workingDirUri) {
+      throw new RpcError(-32001, `Session not found: ${parsed.sessionUri}`);
+    }
+    if (operationId !== 'discard-changes') {
+      throw new RpcError(-32601, `Unsupported changeset operation: ${operationId}`);
+    }
+    if (parsed.kind !== 'uncommitted') {
+      throw new RpcError(-32602, `Operation 'discard-changes' is only supported on uncommitted changesets`);
+    }
+    const target = asRecord(params.target);
+    if (target.kind !== 'resource') {
+      throw new RpcError(-32602, `Operation 'discard-changes' requires a resource target`);
+    }
+    const targetResource = requireString(target.resource, 'target.resource');
+    const targetPath = resourcePath(targetResource);
+    const cwd = resourcePath(workingDirUri);
+    const canonicalCwd = await realpath(cwd).catch(() => resolvePath(cwd));
+    const canonicalTarget = await realpath(targetPath).catch(() => resolvePath(targetPath));
+    if (!isPathWithin(canonicalCwd, canonicalTarget)) {
+      throw new RpcError(-32009, `Permission denied: ${targetResource}`);
+    }
+
+    const repoRoot = await getGitRepoRoot(canonicalCwd);
+    if (repoRoot) {
+      const relPath = relative(repoRoot, canonicalTarget).replace(/\\/g, '/');
+      const untracked = await isGitUntracked(repoRoot, relPath);
+      if (untracked) {
+        await rm(canonicalTarget, { force: true, recursive: true });
+      } else {
+        await execFileAsync('git', ['-C', repoRoot, 'checkout', 'HEAD', '--', relPath]);
+      }
+    }
+    await this.refreshSessionChangesets(parsed.sessionUri);
+    return null;
+  }
+
+  private async readGitBlobResource(
+    uri: string,
+    requestedEncoding: unknown,
+  ): Promise<{ data: string; encoding: string; contentType: string }> {
+    let parsed: URL;
+    try {
+      parsed = new URL(uri);
+    } catch {
+      throw new RpcError(-32602, `Invalid git-blob URI: ${uri}`);
+    }
+    let query: { sessionUri?: string; sha?: string; repoRelativePath?: string };
+    try {
+      query = JSON.parse(decodeURIComponent(parsed.search.replace(/^\?/, ''))) as {
+        sessionUri?: string;
+        sha?: string;
+        repoRelativePath?: string;
+      };
+    } catch {
+      throw new RpcError(-32602, `Invalid git-blob query in URI: ${uri}`);
+    }
+    if (
+      typeof query.sessionUri !== 'string'
+      || typeof query.sha !== 'string'
+      || typeof query.repoRelativePath !== 'string'
+    ) {
+      throw new RpcError(-32602, `Missing git-blob query parameters in URI: ${uri}`);
+    }
+    const session = this.store.getSession(query.sessionUri);
+    const workingDirUri = session?.state.workingDirectories?.[0];
+    if (!session || !workingDirUri) {
+      throw new RpcError(-32008, `Session working directory not found for ${uri}`);
+    }
+    const cwd = resourcePath(workingDirUri);
+    const repoRoot = await getGitRepoRoot(cwd);
+    if (!repoRoot) {
+      throw new RpcError(-32008, `Git repository not found for ${uri}`);
+    }
+    try {
+      const { stdout } = await execFileAsync(
+        'git',
+        ['-C', repoRoot, 'show', `${query.sha}:${query.repoRelativePath}`],
+        { encoding: 'buffer', maxBuffer: 16 * 1024 * 1024 },
+      );
+      const buffer = Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout);
+      const encoding = (requestedEncoding as 'utf-8' | 'base64' | undefined)
+        ?? (isUtf8(buffer) ? 'utf-8' : 'base64');
+      return {
+        data: encoding === 'utf-8' ? buffer.toString('utf8') : buffer.toString('base64'),
+        encoding,
+        contentType: contentType(query.repoRelativePath),
+      };
+    } catch {
+      throw new RpcError(-32008, `Git blob not found: ${uri}`);
+    }
+  }
+
+  private async createResourceWatch(params: Record<string, unknown>): Promise<{ channel: string }> {
+    this.requireRoot(params);
+    const uri = requireWorkingDirectoryUri(requireString(params.uri, 'uri'));
+    const path = resourcePath(uri);
+    let canonicalPath: string;
+    try {
+      canonicalPath = await realpath(path);
+      await stat(canonicalPath);
+    } catch (error) {
+      throw resourceError(error, uri);
+    }
+    if (!await this.resourceReadAllowed(canonicalPath)) {
+      throw new RpcError(-32009, `Permission denied: ${uri}`);
+    }
+    const recursive = Boolean(params.recursive);
+    const excludes = parseFilterPatternList(params.excludes, 'excludes');
+    const includes = parseFilterPatternList(params.includes, 'includes');
+    const watchState: ResourceWatchState = {
+      root: pathToFileURL(canonicalPath).href,
+      recursive,
+      ...(excludes ? { excludes } : {}),
+      ...(includes ? { includes } : {}),
+    };
+    const channel = buildResourceWatchUri(watchState);
+    if (!this.store.getChannel(channel)) {
+      this.store.putChannel(channel, 'resourceWatch', watchState);
+    }
+    return { channel };
+  }
+
+  private ensureResourceWatcherStarted(channel: string): void {
+    if (this.resourceWatchers.has(channel)) return;
+    const state = this.store.getChannel(channel) as ResourceWatchState | undefined;
+    if (!state) return;
+    const rootPath = resourcePath(state.root);
+    const knownExists = new Map<string, boolean>();
+    let watcher: FSWatcher;
+    try {
+      watcher = watchFs(rootPath, { recursive: Boolean(state.recursive) }, (_eventType, filename) => {
+        if (!filename) return;
+        const normalizedRel = String(filename).replace(/\\/g, '/');
+        if (shouldIgnoreWatchedPath(normalizedRel, state.excludes?.items, state.includes?.items)) {
+          return;
+        }
+        const entry = this.resourceWatchers.get(channel);
+        if (!entry) return;
+        entry.pendingPaths.add(resolvePath(rootPath, String(filename)));
+        if (entry.timer) clearTimeout(entry.timer);
+        entry.timer = setTimeout(() => {
+          void this.flushResourceWatchChanges(channel);
+        }, 50);
+      });
+    } catch {
+      return;
+    }
+    watcher.on('error', () => {
+      // Ignore transient OS watch errors
+    });
+    this.resourceWatchers.set(channel, {
+      watcher,
+      pendingPaths: new Set(),
+      knownExists,
+    });
+  }
+
+  private async flushResourceWatchChanges(channel: string): Promise<void> {
+    const entry = this.resourceWatchers.get(channel);
+    if (!entry || this.closing || !this.store.getChannel(channel)) return;
+    const paths = [...entry.pendingPaths];
+    entry.pendingPaths.clear();
+    entry.timer = undefined;
+    if (paths.length === 0) return;
+
+    const items: Array<{ uri: string; type: ResourceChangeType }> = [];
+    for (const fullPath of paths) {
+      const existedBefore = entry.knownExists.get(fullPath);
+      let existsNow = false;
+      try {
+        await lstat(fullPath);
+        existsNow = true;
+      } catch {
+        existsNow = false;
+      }
+      entry.knownExists.set(fullPath, existsNow);
+      const changeType = !existsNow
+        ? ResourceChangeType.Deleted
+        : existedBefore === true
+          ? ResourceChangeType.Updated
+          : ResourceChangeType.Added;
+      items.push({
+        uri: pathToFileURL(fullPath).href,
+        type: changeType,
+      });
+    }
+
+    if (items.length > 0 && this.store.getChannel(channel)) {
+      const envelope = this.store.apply(channel, {
+        type: ActionType.ResourceWatchChanged,
+        changes: { items },
+      } as StateAction);
+      this.broadcastAction(envelope);
+    }
+  }
+
+  private maybeCleanupResourceWatch(channel: string): void {
+    if (this.store.getChannelKind(channel) !== 'resourceWatch') return;
+    for (const conn of this.connections) {
+      if (conn.subscriptions.has(channel)) return;
+    }
+    const active = this.resourceWatchers.get(channel);
+    if (active) {
+      if (active.timer) clearTimeout(active.timer);
+      active.watcher.close();
+      this.resourceWatchers.delete(channel);
+    }
+    this.store.deleteChannel(channel);
+  }
+
   private async dispatchSessionConfig(
     sessionResource: string,
     action: any,
@@ -981,6 +1638,8 @@ export class GatewayServer {
       if (typeof modelId === 'string' && modelId !== 'default') {
         await adapter.setConfigOption('model', modelId);
       }
+      const currentChat = this.store.getChat(chatResource);
+      if (!currentChat?.state.activeTurn || currentChat.state.activeTurn.id !== action.turnId) return;
       await adapter.prompt(action.turnId, action.message.text);
     } catch (error) {
       const chat = this.store.getChat(chatResource);
@@ -999,6 +1658,7 @@ export class GatewayServer {
         },
       } as StateAction);
       this.broadcastAction(envelope);
+      this.syncChatSummary(chat.session, chatResource);
     }
   }
 
@@ -1081,6 +1741,9 @@ export class GatewayServer {
     this.broadcastAction(envelope);
     const session = this.store.getSession(sessionResource);
     if (session) {
+      const defaultChatSummary = session.state.chats.find(
+        (item) => item.resource === (session.state.defaultChat ?? session.state.chats[0]?.resource),
+      );
       this.broadcast('ahp-root://', 'root/sessionSummaryChanged', {
         channel: 'ahp-root://',
         session: sessionResource,
@@ -1088,11 +1751,13 @@ export class GatewayServer {
           status: session.state.status,
           activity: session.state.activity,
           modifiedAt,
+          ...(defaultChatSummary?.changes === undefined ? {} : { changes: defaultChatSummary.changes }),
           chats: session.state.chats.map((item) => ({
             resource: item.resource,
             title: item.title,
             status: item.status,
             modifiedAt: item.modifiedAt,
+            ...(item.changes === undefined ? {} : { changes: item.changes }),
           })),
         },
       });
@@ -1187,6 +1852,9 @@ function chatSummary(state: ChatState) {
 }
 
 function summary(session: StoredSession) {
+  const defaultChatSummary = session.state.chats.find(
+    (item) => item.resource === (session.state.defaultChat ?? session.state.chats[0]?.resource),
+  );
   return {
     resource: session.resource,
     provider: session.provider,
@@ -1203,8 +1871,10 @@ function summary(session: StoredSession) {
       title: chat.title,
       status: chat.status,
       modifiedAt: chat.modifiedAt,
+      ...(chat.changes === undefined ? {} : { changes: chat.changes }),
     })),
     ...(session.state.defaultChat === undefined ? {} : { defaultChat: session.state.defaultChat }),
+    ...(defaultChatSummary?.changes === undefined ? {} : { changes: defaultChatSummary.changes }),
     _meta: session.state._meta,
   };
 }
@@ -1458,7 +2128,8 @@ function delay(ms: number): Promise<void> {
 }
 
 function isAllowedClientAction(type: unknown): boolean {
-  return type === ActionType.ChatTurnStarted
+  return type === ActionType.RootConfigChanged
+    || type === ActionType.ChatTurnStarted
     || type === ActionType.ChatTurnCancelled
     || type === ActionType.ChatToolCallConfirmed
     || type === ActionType.ChatToolCallComplete
@@ -1467,7 +2138,329 @@ function isAllowedClientAction(type: unknown): boolean {
     || type === ActionType.ChatDraftChanged
     || type === ActionType.ChatIsReadChanged
     || type === ActionType.ChatIsArchivedChanged
+    || type === ActionType.ChatTruncated
     || type === ActionType.SessionConfigChanged
+    || type === ActionType.SessionTitleChanged
+    || type === ActionType.SessionIsReadChanged
+    || type === ActionType.SessionIsArchivedChanged
+    || type === ActionType.SessionActiveClientSet
+    || type === ActionType.SessionActiveClientRemoved
+    || type === ActionType.ChangesetFilesReviewChanged
     || type === ActionType.TerminalInput
     || type === ActionType.TerminalResized;
+}
+
+function buildSessionChangesets(sessionResource: string): Changeset[] {
+  return [{
+    label: 'Session Changes',
+    description: 'All changes in this session',
+    uriTemplate: `${sessionResource}/changeset/session`,
+    changeKind: 'session',
+    capabilities: { review: {} },
+  }];
+}
+
+function buildChatChangesets(chatResource: string, sessionResource: string): Changeset[] {
+  return [
+    {
+      label: 'Uncommitted Changes',
+      description: 'Uncommitted changes in the working directory',
+      uriTemplate: `${chatResource}/changeset/uncommitted`,
+      changeKind: 'uncommitted',
+      capabilities: { review: {} },
+    },
+    {
+      label: 'Session Changes',
+      description: 'All changes in this session',
+      uriTemplate: `${sessionResource}/changeset/session`,
+      changeKind: 'session',
+      capabilities: { review: {} },
+    },
+    {
+      label: 'Turn Changes',
+      description: 'Changes from a single turn',
+      uriTemplate: `${chatResource}/changeset/turn/{turnId}`,
+      changeKind: 'turn',
+    },
+  ];
+}
+
+function buildDiscardChangesOperations(files: ChangesetFile[]): ChangesetOperation[] {
+  if (files.length === 0) return [];
+  return [{
+    id: 'discard-changes',
+    label: 'Discard Changes',
+    confirmation: 'Are you sure you want to discard changes to this file?',
+    icon: 'discard',
+    scopes: [ChangesetOperationScope.Resource],
+    status: ChangesetOperationStatus.Idle,
+  }];
+}
+
+interface ParsedChangesetChannel {
+  ownerUri: string;
+  sessionUri: string;
+  kind: 'uncommitted' | 'session' | 'turn';
+  turnId?: string;
+}
+
+function parseChangesetChannel(channel: string): ParsedChangesetChannel | undefined {
+  const marker = '/changeset/';
+  const index = channel.lastIndexOf(marker);
+  if (index <= 0) return undefined;
+  const ownerUri = channel.slice(0, index);
+  const tail = channel.slice(index + marker.length);
+  if (!tail) return undefined;
+
+  if (tail === 'uncommitted') {
+    return {
+      ownerUri,
+      sessionUri: ownerUri,
+      kind: 'uncommitted',
+    };
+  }
+  if (tail === 'session') {
+    return {
+      ownerUri,
+      sessionUri: ownerUri,
+      kind: 'session',
+    };
+  }
+  if (tail.startsWith('turn/')) {
+    const turnId = tail.slice('turn/'.length);
+    if (!turnId || turnId.includes('/') || turnId === '{turnId}') return undefined;
+    return {
+      ownerUri,
+      sessionUri: ownerUri,
+      kind: 'turn',
+      turnId,
+    };
+  }
+  return undefined;
+}
+
+async function getGitRepoRoot(cwd: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync('git', ['-C', cwd, 'rev-parse', '--show-toplevel']);
+    const root = stdout.trim();
+    return root ? await realpath(root).catch(() => root) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function isGitUntracked(repoRoot: string, repoRelativePath: string): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync('git', [
+      '-C',
+      repoRoot,
+      'ls-files',
+      '--others',
+      '--exclude-standard',
+      '--',
+      repoRelativePath,
+    ]);
+    return stdout.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+async function computeWorkingDirectoryChanges(
+  cwd: string,
+  sessionUri: string,
+): Promise<{ files: ChangesetFile[]; summary: ChangesSummary }> {
+  const repoRoot = await getGitRepoRoot(cwd);
+  if (!repoRoot) {
+    return {
+      files: [],
+      summary: { additions: 0, deletions: 0, files: 0 },
+    };
+  }
+
+  let hasHead = true;
+  try {
+    await execFileAsync('git', ['-C', repoRoot, 'rev-parse', '--verify', 'HEAD']);
+  } catch {
+    hasHead = false;
+  }
+
+  const numstatByPath = new Map<string, { added: number; removed: number }>();
+  if (hasHead) {
+    try {
+      const { stdout } = await execFileAsync('git', ['-C', repoRoot, 'diff', '--numstat', 'HEAD']);
+      for (const line of stdout.split(/\r?\n/)) {
+        if (!line.trim()) continue;
+        const parts = line.split('\t');
+        if (parts.length < 3) continue;
+        const added = Number.parseInt(parts[0] ?? '0', 10);
+        const removed = Number.parseInt(parts[1] ?? '0', 10);
+        const pathPart = parts.slice(2).join('\t');
+        numstatByPath.set(pathPart, {
+          added: Number.isFinite(added) ? added : 0,
+          removed: Number.isFinite(removed) ? removed : 0,
+        });
+      }
+    } catch {
+      // Ignore diff errors
+    }
+  }
+
+  let statusStdout = '';
+  try {
+    const res = await execFileAsync('git', [
+      '-C',
+      repoRoot,
+      'status',
+      '--porcelain=v1',
+      '-z',
+      '--untracked-files=all',
+    ]);
+    statusStdout = res.stdout;
+  } catch {
+    return {
+      files: [],
+      summary: { additions: 0, deletions: 0, files: 0 },
+    };
+  }
+
+  const entries = statusStdout.split('\0').filter((part) => part.length > 0);
+  const files: ChangesetFile[] = [];
+  let totalAdditions = 0;
+  let totalDeletions = 0;
+
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i]!;
+    if (entry.length < 4) continue;
+    const xy = entry.slice(0, 2);
+    const repoPath = entry.slice(3);
+    let origRepoPath: string | undefined;
+    if (xy.includes('R') || xy.includes('C')) {
+      origRepoPath = entries[i + 1];
+      if (origRepoPath !== undefined) i++;
+    }
+    const fullPath = join(repoRoot, repoPath);
+    const fileUri = pathToFileURL(fullPath).href;
+    const isUntracked = xy === '??';
+    const isAdded = isUntracked || (xy[0] === 'A' && !hasHead) || (xy[0] === 'A' && xy[1] !== 'D');
+    const isDeleted = xy[0] === 'D' || xy[1] === 'D';
+
+    let diff = numstatByPath.get(repoPath);
+    if (!diff && isUntracked) {
+      try {
+        const buf = await readFile(fullPath);
+        const lines = isUtf8(buf) ? buf.toString('utf8').split(/\r?\n/).length : 0;
+        diff = { added: lines, removed: 0 };
+      } catch {
+        diff = { added: 0, removed: 0 };
+      }
+    }
+    diff ??= { added: 0, removed: 0 };
+    totalAdditions += diff.added;
+    totalDeletions += diff.removed;
+
+    const beforeRepoPath = origRepoPath ?? repoPath;
+    const beforeFileUri = origRepoPath
+      ? pathToFileURL(join(repoRoot, origRepoPath)).href
+      : fileUri;
+    const gitBlobUri = buildGitBlobUri(sessionUri, 'HEAD', beforeRepoPath);
+
+    files.push({
+      id: fileUri,
+      edit: {
+        ...(isAdded && !origRepoPath
+          ? {}
+          : {
+              before: {
+                uri: beforeFileUri,
+                content: { uri: gitBlobUri },
+              },
+            }),
+        ...(isDeleted
+          ? {}
+          : {
+              after: {
+                uri: fileUri,
+                content: { uri: fileUri },
+              },
+            }),
+        diff,
+      },
+    });
+  }
+
+  return {
+    files,
+    summary: {
+      additions: totalAdditions,
+      deletions: totalDeletions,
+      files: files.length,
+    },
+  };
+}
+
+function buildGitBlobUri(sessionUri: string, sha: string, repoRelativePath: string): string {
+  const normalizedPath = repoRelativePath.startsWith('/') ? repoRelativePath : `/${repoRelativePath}`;
+  const query = encodeURIComponent(JSON.stringify({
+    sessionUri,
+    sha,
+    repoRelativePath: repoRelativePath.replace(/^\/+/, ''),
+  }));
+  return `git-blob:${normalizedPath}?${query}`;
+}
+
+function parseFilterPatternList(
+  value: unknown,
+  field: string,
+): { items: string[] } | undefined {
+  if (value === undefined) return undefined;
+  const record = asRecord(value);
+  const items = requireStringArray(record.items, `${field}.items`);
+  return { items };
+}
+
+function buildResourceWatchUri(state: ResourceWatchState): string {
+  const payload: Record<string, unknown> = {
+    root: state.root,
+    ...(state.recursive ? { recursive: true } : {}),
+    ...(state.excludes?.items.length ? { excludes: [...state.excludes.items] } : {}),
+    ...(state.includes?.items.length ? { includes: [...state.includes.items] } : {}),
+  };
+  const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+  return `ahp-resource-watch://r/${encoded}`;
+}
+
+function shouldIgnoreWatchedPath(
+  relativePath: string,
+  excludes: readonly string[] | undefined,
+  includes: readonly string[] | undefined,
+): boolean {
+  const segments = relativePath.split('/').filter(Boolean);
+  if (segments.includes('.git')) return true;
+  if (excludes) {
+    for (const pattern of excludes) {
+      if (matchesSimpleGlob(relativePath, segments, pattern)) return true;
+    }
+  }
+  if (includes && includes.length > 0) {
+    return !includes.some((pattern) => matchesSimpleGlob(relativePath, segments, pattern));
+  }
+  return false;
+}
+
+function matchesSimpleGlob(relativePath: string, segments: string[], pattern: string): boolean {
+  const clean = pattern.replace(/^\*\*\/+/, '').replace(/\/+\*\*$/, '');
+  if (!clean) return false;
+  if (!clean.includes('/') && !clean.includes('*')) {
+    return segments.includes(clean) || relativePath === clean;
+  }
+  const regexStr = '^' + pattern
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*\*/g, '.*')
+    .replace(/\*/g, '[^/]*') + '$';
+  try {
+    return new RegExp(regexStr).test(relativePath);
+  } catch {
+    return false;
+  }
 }

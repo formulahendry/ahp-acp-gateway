@@ -1,12 +1,16 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
+import { promisify } from 'node:util';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 import WebSocket from 'ws';
 import {
   ActionType,
+  ChangesetOperationTargetKind,
+  ChangesetStatus,
   CompletionItemKind,
   ContentEncoding,
   MessageKind,
@@ -15,7 +19,10 @@ import {
   TerminalClaimKind,
   ToolCallConfirmationReason,
   type ActionEnvelope,
+  type ChangesetState,
   type ChatState,
+  type ResourceWatchState,
+  type SessionState,
   type StateAction,
 } from '@microsoft/agent-host-protocol';
 import { AhpClient, type Subscription } from '@microsoft/agent-host-protocol/client';
@@ -35,6 +42,7 @@ import {
   type GatewayConfig,
 } from '../src/config.js';
 
+const execFileAsync = promisify(execFile);
 const fakeAgent = fileURLToPath(new URL('./fake-agent.ts', import.meta.url));
 const fakeAgentNoLoad = fileURLToPath(new URL('./fake-agent-no-load.ts', import.meta.url));
 
@@ -1092,6 +1100,342 @@ test('provider authentication failures show login guidance instead of install gu
     }),
     /requires authentication.*Run the provider login command/,
   );
+});
+
+test('ChatTurnStarted rejects missing or invalid startedAt and repairInterruptedTurns heals legacy corrupt rows', async (t) => {
+  const fixture = await startFixture();
+  t.after(fixture.close);
+  const client = await connectClient(fixture.url, 'timestamp-client');
+  t.after(() => client.shutdown());
+
+  const { session, chat } = await createSession(client, 'timestamp-validation');
+  const chatSub = (await client.subscribe(chat)).subscription;
+
+  // Missing startedAt must be rejected without crashing or starting a turn
+  client.dispatch(chat, {
+    type: ActionType.ChatTurnStarted,
+    turnId: 'bad-turn-1',
+    message: { text: 'hello', origin: { kind: MessageKind.User } },
+  } as unknown as StateAction);
+  const rejectedMissing = await nextAction(chatSub, (item) => item.rejectionReason !== undefined);
+  assert.match(rejectedMissing.rejectionReason ?? '', /startedAt must be a valid ISO timestamp/);
+  assert.equal((fixture.server.store.getChat(chat)?.state as ChatState).activeTurn, undefined);
+
+  // Invalid startedAt string must also be rejected
+  client.dispatch(chat, {
+    type: ActionType.ChatTurnStarted,
+    turnId: 'bad-turn-2',
+    startedAt: 'not-a-timestamp',
+    message: { text: 'hello', origin: { kind: MessageKind.User } },
+  } as unknown as StateAction);
+  const rejectedInvalid = await nextAction(chatSub, (item) => item.rejectionReason !== undefined);
+  assert.match(rejectedInvalid.rejectionReason ?? '', /startedAt must be a valid ISO timestamp/);
+
+  // Empty turnId must be rejected
+  client.dispatch(chat, {
+    type: ActionType.ChatTurnStarted,
+    turnId: '',
+    startedAt: new Date().toISOString(),
+    message: { text: 'hello', origin: { kind: MessageKind.User } },
+  } as unknown as StateAction);
+  const rejectedTurnId = await nextAction(chatSub, (item) => item.rejectionReason !== undefined);
+  assert.match(rejectedTurnId.rejectionReason ?? '', /turnId must be a non-empty string/);
+
+  // Simulate legacy corrupt activeTurn in SQLite (missing startedAt) and verify repairInterruptedTurns does not throw RangeError
+  const stored = fixture.server.store.getChat(chat)!;
+  stored.state.activeTurn = {
+    id: 'corrupt-turn',
+    startedAt: 'invalid-date',
+    userMessage: { text: 'corrupt', origin: { kind: MessageKind.User } },
+    responseParts: [],
+    citations: [],
+  } as any;
+  fixture.server.store.putChat(stored);
+  const repaired = fixture.server.store.repairInterruptedTurns();
+  assert.equal(repaired.length, 1);
+  assert.equal(fixture.server.store.getChat(chat)?.state.activeTurn, undefined);
+  assert.equal(fixture.server.store.getSession(session)?.state.status, SessionStatus.Idle);
+});
+
+test('VS Code client-dispatchable actions and multi-client activeClients lifecycle work across concurrent clients', async (t) => {
+  const fixture = await startFixture();
+  t.after(fixture.close);
+  const clientA = await connectClient(fixture.url, 'vscode-client-a');
+  const clientB = await connectClient(fixture.url, 'vscode-client-b');
+  t.after(() => clientA.shutdown());
+  t.after(() => clientB.shutdown());
+
+  // 1. RootConfigChanged (dispatched by VS Code on connect)
+  const rootSubA = (await clientA.subscribe('ahp-root://')).subscription;
+  clientA.dispatch('ahp-root://', {
+    type: ActionType.RootConfigChanged,
+    config: {
+      'github.copilot.chat.claudeCode.models': [],
+      'chat.autopilot.enabled': true,
+    },
+  } as StateAction);
+  const rootAccepted = await nextAction(rootSubA, (item) => item.action.type === ActionType.RootConfigChanged);
+  assert.equal(rootAccepted.rejectionReason, undefined);
+
+  // 2. Session & Chat client-dispatchable actions + activeClients lifecycle
+  const { session, chat } = await createSession(clientA, 'collab-session');
+  const sessionSubA = (await clientA.subscribe(session)).subscription;
+  const sessionSubB = (await clientB.subscribe(session)).subscription;
+  const chatSubA = (await clientA.subscribe(chat)).subscription;
+
+  clientA.dispatch(session, {
+    type: ActionType.SessionActiveClientSet,
+    activeClient: {
+      clientId: 'vscode-client-a',
+      tools: [{ name: 'vscode_get_diagnostics', description: 'Get diagnostics', inputSchema: { type: 'object' } }],
+    },
+  } as StateAction);
+  await nextAction(sessionSubB, (item) => item.action.type === ActionType.SessionActiveClientSet);
+
+  clientB.dispatch(session, {
+    type: ActionType.SessionActiveClientSet,
+    activeClient: {
+      clientId: 'vscode-client-b',
+      tools: [],
+    },
+  } as StateAction);
+  await nextAction(sessionSubA, (item) =>
+    item.action.type === ActionType.SessionActiveClientSet
+    && (item.action as any).activeClient.clientId === 'vscode-client-b');
+
+  // Spoofing another clientId must be rejected
+  clientA.dispatch(session, {
+    type: ActionType.SessionActiveClientRemoved,
+    clientId: 'vscode-client-b',
+  } as StateAction);
+  const spoofRejected = await nextAction(sessionSubA, (item) => item.rejectionReason !== undefined);
+  assert.match(spoofRejected.rejectionReason ?? '', /clientId must match connection clientId/);
+
+  // SessionTitleChanged, SessionIsReadChanged, SessionIsArchivedChanged
+  clientA.dispatch(session, {
+    type: ActionType.SessionTitleChanged,
+    title: 'Renamed Session',
+  } as StateAction);
+  await nextAction(sessionSubB, (item) => item.action.type === ActionType.SessionTitleChanged);
+  assert.equal(fixture.server.store.getSession(session)?.state.title, 'Renamed Session');
+
+  clientA.dispatch(session, {
+    type: ActionType.SessionIsReadChanged,
+    isRead: false,
+  } as StateAction);
+  await nextAction(sessionSubB, (item) => item.action.type === ActionType.SessionIsReadChanged);
+
+  clientA.dispatch(session, {
+    type: ActionType.SessionIsArchivedChanged,
+    isArchived: true,
+  } as StateAction);
+  await nextAction(sessionSubB, (item) => item.action.type === ActionType.SessionIsArchivedChanged);
+
+  // ChatDraftChanged & ChatTruncated
+  clientA.dispatch(chat, {
+    type: ActionType.ChatDraftChanged,
+    draft: { text: 'work in progress' },
+  } as StateAction);
+  await nextAction(chatSubA, (item) => item.action.type === ActionType.ChatDraftChanged);
+  assert.equal(fixture.server.store.getChat(chat)?.state.draft?.text, 'work in progress');
+
+  // Disconnecting clientB automatically removes clientB from activeClients
+  await clientB.shutdown();
+  await nextAction(sessionSubA, (item) =>
+    item.action.type === ActionType.SessionActiveClientRemoved
+    && (item.action as any).clientId === 'vscode-client-b');
+  const activeClients = (fixture.server.store.getSession(session)?.state as SessionState).activeClients;
+  assert.deepEqual(activeClients.map((item) => item.clientId), ['vscode-client-a']);
+});
+
+test('interleaved markdown chunks and tool calls preserve chronological responseParts order', async (t) => {
+  const fixture = await startFixture();
+  t.after(fixture.close);
+  const client = await connectClient(fixture.url, 'interleaved-client');
+  t.after(() => client.shutdown());
+
+  const { chat } = await createSession(client, 'interleaved');
+  const chatSub = (await client.subscribe(chat)).subscription;
+  const turnId = crypto.randomUUID();
+  client.dispatch(chat, userTurn(turnId, 'interleaved-tools'));
+  await collectUntil(chatSub, ActionType.ChatTurnComplete);
+
+  const state = fixture.server.store.getChat(chat)?.state as ChatState;
+  const turn = state.turns.find((item) => item.id === turnId);
+  assert.ok(turn);
+  assert.deepEqual(
+    turn.responseParts.map((part) =>
+      part.kind === 'markdown' ? `md:${part.content}` : part.kind),
+    ['reasoning', 'md:before-tool', 'toolCall', 'md:after-tool'],
+  );
+});
+
+test('restored sessions via ACP session/load retain configOptionTypes and syncChatSummary on model error', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'ahp-acp-gateway-load-config-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+
+  const firstServer = new GatewayServer(testConfig(directory));
+  const firstAddress = await firstServer.listen();
+  const firstUrl = `ws://${firstAddress.host}:${firstAddress.port}${firstAddress.path}`;
+  const firstClient = await connectClient(firstUrl, 'first-load-client');
+  const { session, chat } = await createSession(firstClient, 'restorable-config');
+  await firstClient.shutdown();
+  await firstServer.close();
+
+  const secondServer = new GatewayServer(testConfig(directory));
+  const secondAddress = await secondServer.listen();
+  t.after(() => secondServer.close());
+  const secondUrl = `ws://${secondAddress.host}:${secondAddress.port}${secondAddress.path}`;
+  const secondClient = await connectClient(secondUrl, 'second-load-client');
+  t.after(() => secondClient.shutdown());
+
+  const chatSub = (await secondClient.subscribe(chat)).subscription;
+  const sessionSub = (await secondClient.subscribe(session)).subscription;
+
+  // Switching model on a restored session must succeed because configOptionTypes is restored
+  const turnId = crypto.randomUUID();
+  secondClient.dispatch(chat, {
+    type: ActionType.ChatTurnStarted,
+    turnId,
+    startedAt: new Date().toISOString(),
+    message: {
+      text: 'report-model',
+      origin: { kind: MessageKind.User },
+      model: { id: 'fake-model-2', provider: 'fake' },
+    },
+  } as StateAction);
+  const actions = await collectUntil(chatSub, ActionType.ChatTurnComplete);
+  assert.ok(actions.some((item) =>
+    item.action.type === ActionType.ChatDelta && item.action.content === 'model:fake-model-2'));
+
+  // SessionConfigChanged on restored session also works
+  secondClient.dispatch(session, {
+    type: ActionType.SessionConfigChanged,
+    config: { mode: 'plan' },
+  } as StateAction);
+  const configAccepted = await nextAction(sessionSub, (item) => item.action.type === ActionType.SessionConfigChanged);
+  assert.equal(configAccepted.rejectionReason, undefined);
+});
+
+test('Changeset channels, git-blob resourceRead, review state, discard-changes, and createResourceWatch work end-to-end', async (t) => {
+  const fixture = await startFixture();
+  t.after(fixture.close);
+  const repoDir = await mkdtemp(join(tmpdir(), 'ahp-acp-git-repo-'));
+  t.after(() => rm(repoDir, { recursive: true, force: true }));
+
+  await execFileAsync('git', ['init'], { cwd: repoDir });
+  await execFileAsync('git', ['config', 'user.email', 'test@example.com'], { cwd: repoDir });
+  await execFileAsync('git', ['config', 'user.name', 'Test User'], { cwd: repoDir });
+  const trackedFile = join(repoDir, 'hello.txt');
+  await writeFile(trackedFile, 'line1\nline2\n', 'utf8');
+  await execFileAsync('git', ['add', 'hello.txt'], { cwd: repoDir });
+  await execFileAsync('git', ['commit', '-m', 'Initial commit'], { cwd: repoDir });
+
+  const client = await connectClient(fixture.url, 'changeset-client');
+  t.after(() => client.shutdown());
+
+  const session = `ahp-session:/changeset-test-${crypto.randomUUID()}`;
+  const repoUri = pathToFileURL(repoDir).href;
+  await client.request('createSession', {
+    channel: session,
+    provider: 'fake',
+    workingDirectories: [repoUri],
+  });
+  const sessionSnap = (await client.subscribe(session)).result.snapshot?.state as SessionState;
+  assert.ok(sessionSnap.changesets && sessionSnap.changesets.length >= 1);
+  const chat = sessionSnap.defaultChat!;
+  const chatSnap = (await client.subscribe(chat)).result.snapshot?.state as ChatState;
+  assert.ok(chatSnap.changesets && chatSnap.changesets.some((cs) => cs.changeKind === 'uncommitted'));
+
+  // 1. Setup resourceWatch on the repo directory
+  const watchRes = await client.request('createResourceWatch', {
+    channel: 'ahp-root://',
+    uri: repoUri,
+    recursive: true,
+    excludes: { items: ['**/.git/**'] },
+  }) as { channel: string };
+  assert.match(watchRes.channel, /^ahp-resource-watch:\/\/r\//);
+  const watchSubscribed = await client.subscribe(watchRes.channel);
+  const watchState = watchSubscribed.result.snapshot?.state as ResourceWatchState;
+  assert.equal(watchState.recursive, true);
+
+  // Modify tracked file and add untracked file
+  await writeFile(trackedFile, 'line1\nline2-modified\nline3\n', 'utf8');
+  const untrackedFile = join(repoDir, 'added.txt');
+  await writeFile(untrackedFile, 'new file content\n', 'utf8');
+
+  // Verify resourceWatch emits ResourceWatchChanged
+  const watchAction = await nextAction(
+    watchSubscribed.subscription,
+    (item) => item.action.type === ActionType.ResourceWatchChanged,
+  );
+  assert.ok((watchAction.action as any).changes.items.length >= 1);
+
+  // 2. Run a turn so changesets refresh automatically
+  const chatSub = (await client.subscribe(chat)).subscription;
+  const turnId = crypto.randomUUID();
+  client.dispatch(chat, userTurn(turnId, 'hello'));
+  await collectUntil(chatSub, ActionType.ChatTurnComplete);
+
+  // 3. Subscribe to uncommitted changeset, session changeset, and turn changeset
+  const uncommittedChannel = `${chat}/changeset/uncommitted`;
+  const uncommittedSub = await client.subscribe(uncommittedChannel);
+  await waitForCondition(() => {
+    const cs = fixture.server.store.getChannel(uncommittedChannel) as ChangesetState | undefined;
+    return cs?.status === ChangesetStatus.Ready && (cs.files?.length ?? 0) === 2;
+  });
+  const uncommittedState = fixture.server.store.getChannel(uncommittedChannel) as ChangesetState;
+  assert.equal(uncommittedState.files.length, 2);
+  assert.ok(uncommittedState.operations?.some((op) => op.id === 'discard-changes'));
+
+  const modifiedEntry = uncommittedState.files.find((f) => f.id.endsWith('/hello.txt'));
+  assert.ok(modifiedEntry?.edit.before?.content?.uri);
+  assert.ok(modifiedEntry.edit.after?.content?.uri);
+  assert.equal(modifiedEntry.edit.diff?.added, 2);
+  assert.equal(modifiedEntry.edit.diff?.removed, 1);
+
+  // 4. Read before content via git-blob: URI in resourceRead
+  const beforeBlob = await client.request('resourceRead', {
+    channel: 'ahp-root://',
+    uri: modifiedEntry.edit.before.content.uri,
+  });
+  assert.equal(beforeBlob.data, 'line1\nline2\n');
+  assert.equal(beforeBlob.encoding, ContentEncoding.Utf8);
+
+  // 5. Mark file as reviewed via ChangesetFilesReviewChanged
+  client.dispatch(uncommittedChannel, {
+    type: ActionType.ChangesetFilesReviewChanged,
+    files: [modifiedEntry.id],
+    reviewed: true,
+  } as StateAction);
+  await nextAction(
+    uncommittedSub.subscription,
+    (item) => item.action.type === ActionType.ChangesetFilesReviewChanged,
+  );
+  const afterReview = fixture.server.store.getChannel(uncommittedChannel) as ChangesetState;
+  assert.equal(afterReview.files.find((f) => f.id === modifiedEntry.id)?.reviewed, true);
+
+  // 6. Verify Turn changeset subscription on demand
+  const turnChangesetChannel = `${chat}/changeset/turn/${turnId}`;
+  const turnChangesetSnap = (await client.subscribe(turnChangesetChannel)).result.snapshot?.state as ChangesetState;
+  assert.equal(turnChangesetSnap.status, ChangesetStatus.Ready);
+  assert.equal(turnChangesetSnap.files.length, 2);
+
+  // 7. Invoke discard-changes operation on hello.txt
+  await client.request('invokeChangesetOperation', {
+    channel: uncommittedChannel,
+    operationId: 'discard-changes',
+    target: { kind: ChangesetOperationTargetKind.Resource, resource: modifiedEntry.id },
+  });
+  assert.equal(await readFile(trackedFile, 'utf8'), 'line1\nline2\n');
+  const afterDiscard = fixture.server.store.getChannel(uncommittedChannel) as ChangesetState;
+  assert.equal(afterDiscard.files.length, 1);
+  assert.ok(afterDiscard.files[0]?.id.endsWith('/added.txt'));
+
+  // 8. Unsubscribe from resourceWatch cleans up the channel
+  await client.unsubscribe(watchRes.channel);
+  await waitForCondition(() => fixture.server.store.getChannel(watchRes.channel) === undefined);
+  assert.equal(fixture.server.store.getChannel(watchRes.channel), undefined);
 });
 
 function storedSession(resource: string, chat: string, now: string) {

@@ -94,7 +94,12 @@ class AcpV1Process implements AcpAdapter {
   private ready = false;
   private stopResolve: (() => void) | undefined;
   private stderrTail = '';
-  private currentTurn: { id: string; startedAt: number; markdownPart?: string; reasoningPart?: string } | undefined;
+  private currentTurn: {
+    id: string;
+    startedAt: number;
+    markdownPart?: string | undefined;
+    reasoningPart?: string | undefined;
+  } | undefined;
   private cancelRequested = false;
   private promptSettled: Promise<void> | undefined;
   private resolvePromptSettled: (() => void) | undefined;
@@ -111,6 +116,13 @@ class AcpV1Process implements AcpAdapter {
     this.binding = { ...binding, provider: provider.id };
     this.workingDirectories = workingDirectories;
     this.callbacks = callbacks;
+    if (binding.configOptionTypes) {
+      for (const [key, optionType] of Object.entries(binding.configOptionTypes)) {
+        if (optionType === 'select' || optionType === 'boolean') {
+          this.configOptionTypes.set(key, optionType);
+        }
+      }
+    }
   }
 
   async start(): Promise<void> {
@@ -194,11 +206,15 @@ class AcpV1Process implements AcpAdapter {
         let contextReset = false;
 
         if (sessionId && loadSupported) {
-          await ctx.request(acp.methods.agent.session.load, {
+          const loaded = await ctx.request(acp.methods.agent.session.load, {
             sessionId,
             ...this.sessionDirectories(),
             mcpServers: [],
           });
+          const loadedState = loaded as unknown as { configOptions?: unknown[] } | undefined;
+          if (loadedState?.configOptions) {
+            this.publishConfigOptions(loadedState.configOptions);
+          }
         } else {
           const created = await ctx.request(acp.methods.agent.session.new, {
             ...this.sessionDirectories(),
@@ -209,7 +225,12 @@ class AcpV1Process implements AcpAdapter {
           contextReset = Boolean(sessionId);
           sessionId = created.sessionId;
         }
-        Object.assign(this.binding, { acpSessionId: sessionId, loadSupported, contextReset });
+        Object.assign(this.binding, {
+          acpSessionId: sessionId,
+          loadSupported,
+          contextReset,
+          configOptionTypes: Object.fromEntries(this.configOptionTypes),
+        });
         this.callbacks.bindingChanged({ ...this.binding });
         this.ready = true;
         this.callbacks.ready();
@@ -422,6 +443,8 @@ class AcpV1Process implements AcpAdapter {
 
   private handlePermission(params: acp.RequestPermissionRequest): Promise<acp.RequestPermissionResponse> {
     const turn = this.requireTurn();
+    turn.markdownPart = undefined;
+    turn.reasoningPart = undefined;
     const toolCallId = params.toolCall.toolCallId;
     const title = params.toolCall.title ?? this.toolTitles.get(toolCallId) ?? toolCallId;
     if (!this.toolTitles.has(toolCallId)) {
@@ -497,6 +520,7 @@ class AcpV1Process implements AcpAdapter {
     switch (update.sessionUpdate) {
       case 'agent_message_chunk': {
         if (update.content.type !== 'text') return;
+        turn.reasoningPart = undefined;
         if (!turn.markdownPart) {
           turn.markdownPart = crypto.randomUUID();
           this.callbacks.emit({
@@ -515,6 +539,7 @@ class AcpV1Process implements AcpAdapter {
       }
       case 'agent_thought_chunk': {
         if (update.content.type !== 'text') return;
+        turn.markdownPart = undefined;
         if (!turn.reasoningPart) {
           turn.reasoningPart = crypto.randomUUID();
           this.callbacks.emit({
@@ -539,6 +564,8 @@ class AcpV1Process implements AcpAdapter {
         break;
       }
       case 'tool_call': {
+        turn.markdownPart = undefined;
+        turn.reasoningPart = undefined;
         this.toolTitles.set(update.toolCallId, update.title);
         this.callbacks.emit({
           type: ActionType.ChatToolCallStart,
@@ -595,6 +622,8 @@ class AcpV1Process implements AcpAdapter {
         } as StateAction);
         break;
       case 'notice':
+        turn.markdownPart = undefined;
+        turn.reasoningPart = undefined;
         this.callbacks.emit({
           type: ActionType.ChatResponsePart,
           turnId: turn.id,
@@ -619,7 +648,7 @@ class AcpV1Process implements AcpAdapter {
   }
 
   private appendMarkdown(
-    turn: { id: string; markdownPart?: string },
+    turn: { id: string; markdownPart?: string | undefined },
     content: string,
   ): void {
     if (!turn.markdownPart) {
@@ -711,6 +740,8 @@ class AcpV1Process implements AcpAdapter {
         sessionMutable: true,
       };
     }
+    this.binding.configOptionTypes = Object.fromEntries(this.configOptionTypes);
+    this.callbacks.bindingChanged({ ...this.binding });
     this.callbacks.configChanged({
       schema: {
         type: 'object',
@@ -721,7 +752,12 @@ class AcpV1Process implements AcpAdapter {
     this.callbacks.controlUpdate('configOptions', { values });
   }
 
-  private requireTurn(): { id: string; startedAt: number; markdownPart?: string; reasoningPart?: string } {
+  private requireTurn(): {
+    id: string;
+    startedAt: number;
+    markdownPart?: string | undefined;
+    reasoningPart?: string | undefined;
+  } {
     if (!this.currentTurn) throw new Error('ACP requested permission outside an active turn');
     return this.currentTurn;
   }
