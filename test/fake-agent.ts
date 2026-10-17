@@ -283,7 +283,7 @@ acp.agent({ name: 'ahp-acp-gateway-test-agent' })
     }
 
     sessions.set(ctx.params.sessionId, undefined);
-    if (text === 'exit-after') setTimeout(() => process.exit(0), 20);
+    if (text === 'exit-after') setTimeout(() => process.exit(0), 250);
     return { stopReason: 'end_turn' };
   })
   .onNotification(acp.methods.agent.session.cancel, (ctx) => {
