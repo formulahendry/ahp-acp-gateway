@@ -1268,6 +1268,7 @@ export class GatewayServer {
   }
 
   private async refreshSessionChangesets(sessionResource: string, turnId?: string): Promise<void> {
+    if (this.closing) return;
     const session = this.store.getSession(sessionResource);
     if (!session) return;
     const workingDirUri = session.state.workingDirectories?.[0];
@@ -1277,6 +1278,7 @@ export class GatewayServer {
     this.ensureStaticChangesets(sessionResource, chatResource);
     const cwd = resourcePath(workingDirUri);
     const { files, summary: changesSummary } = await computeWorkingDirectoryChanges(cwd, sessionResource);
+    if (this.closing) return;
 
     const uncommittedUri = `${chatResource}/changeset/uncommitted`;
     const sessionChangesetUri = `${sessionResource}/changeset/session`;

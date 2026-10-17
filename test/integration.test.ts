@@ -1270,9 +1270,8 @@ test('interleaved markdown chunks and tool calls preserve chronological response
   );
 });
 
-test('restored sessions via ACP session/load retain configOptionTypes and syncChatSummary on model error', async (t) => {
+test('restored sessions via ACP session/load retain configOptionTypes and syncChatSummary on model error', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'ahp-acp-gateway-load-config-'));
-  t.after(() => rm(directory, { recursive: true, force: true }));
 
   const firstServer = new GatewayServer(testConfig(directory));
   const firstAddress = await firstServer.listen();
@@ -1284,55 +1283,60 @@ test('restored sessions via ACP session/load retain configOptionTypes and syncCh
 
   const secondServer = new GatewayServer(testConfig(directory));
   const secondAddress = await secondServer.listen();
-  t.after(() => secondServer.close());
   const secondUrl = `ws://${secondAddress.host}:${secondAddress.port}${secondAddress.path}`;
   const secondClient = await connectClient(secondUrl, 'second-load-client');
-  t.after(() => secondClient.shutdown());
+  try {
+    const chatSub = (await secondClient.subscribe(chat)).subscription;
+    const sessionSub = (await secondClient.subscribe(session)).subscription;
 
-  const chatSub = (await secondClient.subscribe(chat)).subscription;
-  const sessionSub = (await secondClient.subscribe(session)).subscription;
+    // Switching model on a restored session must succeed because configOptionTypes is restored
+    const turnId = crypto.randomUUID();
+    secondClient.dispatch(chat, {
+      type: ActionType.ChatTurnStarted,
+      turnId,
+      startedAt: new Date().toISOString(),
+      message: {
+        text: 'report-model',
+        origin: { kind: MessageKind.User },
+        model: { id: 'fake-model-2', provider: 'fake' },
+      },
+    } as StateAction);
+    const actions = await collectUntil(chatSub, ActionType.ChatTurnComplete);
+    assert.ok(actions.some((item) =>
+      item.action.type === ActionType.ChatDelta && item.action.content === 'model:fake-model-2'));
 
-  // Switching model on a restored session must succeed because configOptionTypes is restored
-  const turnId = crypto.randomUUID();
-  secondClient.dispatch(chat, {
-    type: ActionType.ChatTurnStarted,
-    turnId,
-    startedAt: new Date().toISOString(),
-    message: {
-      text: 'report-model',
-      origin: { kind: MessageKind.User },
-      model: { id: 'fake-model-2', provider: 'fake' },
-    },
-  } as StateAction);
-  const actions = await collectUntil(chatSub, ActionType.ChatTurnComplete);
-  assert.ok(actions.some((item) =>
-    item.action.type === ActionType.ChatDelta && item.action.content === 'model:fake-model-2'));
-
-  // SessionConfigChanged on restored session also works
-  secondClient.dispatch(session, {
-    type: ActionType.SessionConfigChanged,
-    config: { mode: 'plan' },
-  } as StateAction);
-  const configAccepted = await nextAction(sessionSub, (item) => item.action.type === ActionType.SessionConfigChanged);
-  assert.equal(configAccepted.rejectionReason, undefined);
+    // SessionConfigChanged on restored session also works
+    secondClient.dispatch(session, {
+      type: ActionType.SessionConfigChanged,
+      config: { mode: 'plan' },
+    } as StateAction);
+    const configAccepted = await nextAction(sessionSub, (item) => item.action.type === ActionType.SessionConfigChanged);
+    assert.equal(configAccepted.rejectionReason, undefined);
+  } finally {
+    await secondClient.shutdown();
+    await secondServer.close();
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test('Changeset channels, git-blob resourceRead, review state, discard-changes, and createResourceWatch work end-to-end', async (t) => {
   const fixture = await startFixture();
-  t.after(fixture.close);
   const repoDir = await mkdtemp(join(tmpdir(), 'ahp-acp-git-repo-'));
-  t.after(() => rm(repoDir, { recursive: true, force: true }));
+  const client = await connectClient(fixture.url, 'changeset-client');
+  t.after(async () => {
+    await client.shutdown();
+    await fixture.close();
+    await rm(repoDir, { recursive: true, force: true });
+  });
 
   await execFileAsync('git', ['init'], { cwd: repoDir });
   await execFileAsync('git', ['config', 'user.email', 'test@example.com'], { cwd: repoDir });
   await execFileAsync('git', ['config', 'user.name', 'Test User'], { cwd: repoDir });
+  await execFileAsync('git', ['config', 'core.autocrlf', 'false'], { cwd: repoDir });
   const trackedFile = join(repoDir, 'hello.txt');
   await writeFile(trackedFile, 'line1\nline2\n', 'utf8');
   await execFileAsync('git', ['add', 'hello.txt'], { cwd: repoDir });
   await execFileAsync('git', ['commit', '-m', 'Initial commit'], { cwd: repoDir });
-
-  const client = await connectClient(fixture.url, 'changeset-client');
-  t.after(() => client.shutdown());
 
   const session = `ahp-session:/changeset-test-${crypto.randomUUID()}`;
   const repoUri = pathToFileURL(repoDir).href;
