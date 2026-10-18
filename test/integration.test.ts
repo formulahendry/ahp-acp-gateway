@@ -375,9 +375,28 @@ test('client-chosen non-ahp session URI schemes are supported', async (t) => {
     channel: session,
     provider: 'fake',
     workingDirectories: [pathToFileURL(process.cwd()).href],
+    config: {
+      mode: 'unsupported-client-default-mode',
+      unknownKey: 'ignored',
+    },
   });
-  const snapshot = (await client.subscribe(session)).result.snapshot?.state;
+  const snapshot = (await client.subscribe(session)).result.snapshot?.state as SessionState | undefined;
   assert.ok(snapshot && 'provider' in snapshot);
+  assert.equal(snapshot.config?.values?.mode, 'interactive');
+  assert.equal(snapshot.config?.values?.unknownKey, undefined);
+
+  const validConfigSession = `remote-agent-session:/${crypto.randomUUID()}`;
+  await client.request('createSession', {
+    channel: validConfigSession,
+    provider: 'fake',
+    config: {
+      mode: 'plan',
+    },
+  });
+  const validSnapshot = (await client.subscribe(validConfigSession)).result.snapshot?.state as SessionState | undefined;
+  assert.equal(validSnapshot?.config?.values?.mode, 'plan');
+  assert.deepEqual(validSnapshot?.workingDirectories, [pathToFileURL(process.cwd()).href]);
+  await client.request('disposeSession', { channel: validConfigSession });
   assert.equal(snapshot.provider, 'fake');
   client.dispatch(session, {
     type: ActionType.SessionConfigChanged,

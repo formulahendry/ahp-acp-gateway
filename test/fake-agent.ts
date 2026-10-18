@@ -107,6 +107,14 @@ acp.agent({ name: 'ahp-acp-gateway-test-agent' })
     } as any;
   })
   .onRequest(acp.methods.agent.session.setConfigOption, (ctx) => {
+    const allowed: Record<string, string[]> = {
+      model: ['fake-model', 'fake-model-2'],
+      mode: ['interactive', 'plan'],
+    };
+    const validOptions = allowed[ctx.params.configId];
+    if (!validOptions || typeof ctx.params.value !== 'string' || !validOptions.includes(ctx.params.value)) {
+      throw new acp.RequestError(-32603, `Invalid ${ctx.params.configId} '${String(ctx.params.value)}'`);
+    }
     const values = sessionConfigValues.get(ctx.params.sessionId) ?? {};
     values[ctx.params.configId] = ctx.params.value;
     sessionConfigValues.set(ctx.params.sessionId, values);

@@ -690,7 +690,7 @@ export class GatewayServer {
     const requestedDirectories = optionalStringArray(params.workingDirectories);
     const workingDirectories = requestedDirectories.length > 0
       ? requestedDirectories.slice(0, 1).map(requireWorkingDirectoryUri)
-      : undefined;
+      : [pathToFileURL(process.cwd()).href];
     const now = new Date().toISOString();
     const chatResource = `ahp-chat:/${crypto.randomUUID()}`;
     const chatChangesets = workingDirectories ? buildChatChangesets(chatResource, resource) : undefined;
@@ -749,10 +749,18 @@ export class GatewayServer {
     try {
       await adapter.start();
       if (params.config !== undefined) {
+        const startedSession = this.store.getSession(resource);
+        const schemaProps = startedSession?.state.config?.schema.properties ?? {};
         for (const [configId, value] of Object.entries(asRecord(params.config))) {
-          if (typeof value === 'string' || typeof value === 'boolean') {
-            await adapter.setConfigOption(configId, value);
+          if (typeof value !== 'string' && typeof value !== 'boolean') continue;
+          const property = schemaProps[configId];
+          if (!property) continue;
+          if (property.type === 'boolean' && typeof value !== 'boolean') continue;
+          if (property.type === 'string') {
+            if (typeof value !== 'string') continue;
+            if (Array.isArray(property.enum) && !property.enum.includes(value)) continue;
           }
+          await adapter.setConfigOption(configId, value);
         }
       }
       this.markSessionReady(resource);
