@@ -1076,7 +1076,7 @@ test('missing provider commands surface installation guidance', async (t) => {
       provider: 'fake',
       workingDirectories: [pathToFileURL(process.cwd()).href],
     }),
-    /Install the test provider first/,
+    /executable "definitely-missing-ahp-acp-provider" was not found on PATH.*Install the test provider first/,
   );
   assert.equal(
     fixture.server.store.getSession(failedSession)?.state.lifecycle,
@@ -1095,10 +1095,35 @@ test('provider authentication failures show login guidance instead of install gu
   const fixture = await startFixture();
   t.after(fixture.close);
   const provider = fixture.server.config.providers[0]!;
-  provider.args = ['--import', 'tsx', fakeAgent, '--auth-required'];
-  provider.authHint = 'Run the provider login command.';
   const client = await connectClient(fixture.url, 'auth-required-client');
   t.after(() => client.shutdown());
+
+  // 1. Default automatic guidance when authHint is NOT configured and no authMethods are advertised
+  delete provider.authHint;
+  provider.args = ['--import', 'tsx', fakeAgent, '--auth-required'];
+  await assert.rejects(
+    client.request('createSession', {
+      channel: `ahp-session:/auth-default-${crypto.randomUUID()}`,
+      provider: 'fake',
+      workingDirectories: [pathToFileURL(process.cwd()).href],
+    }),
+    /requires authentication\. Sign in with ".*" in a terminal or configure the required API key\/credentials/,
+  );
+
+  // 2. Automatic guidance using ACP InitializeResponse.authMethods when authHint is NOT configured
+  provider.args = ['--import', 'tsx', fakeAgent, '--auth-required', '--auth-methods'];
+  await assert.rejects(
+    client.request('createSession', {
+      channel: `ahp-session:/auth-methods-${crypto.randomUUID()}`,
+      provider: 'fake',
+      workingDirectories: [pathToFileURL(process.cwd()).href],
+    }),
+    /requires authentication\. Sign in or configure credentials for Fake ACP \(available auth methods: OAuth Login \(Browser sign-in\)\)/,
+  );
+
+  // 3. Explicit authHint override when configured
+  provider.args = ['--import', 'tsx', fakeAgent, '--auth-required'];
+  provider.authHint = 'Run the provider login command.';
   await assert.rejects(
     client.request('createSession', {
       channel: `ahp-session:/auth-required-${crypto.randomUUID()}`,
@@ -1106,6 +1131,18 @@ test('provider authentication failures show login guidance instead of install gu
       workingDirectories: [pathToFileURL(process.cwd()).href],
     }),
     /requires authentication.*Run the provider login command/,
+  );
+
+  // 4. Stderr-based authentication exit before JSON-RPC response (without authHint)
+  delete provider.authHint;
+  provider.args = ['-e', 'process.stderr.write("Error: missing API_KEY / please login\\n"); process.exit(1);'];
+  await assert.rejects(
+    client.request('createSession', {
+      channel: `ahp-session:/auth-stderr-${crypto.randomUUID()}`,
+      provider: 'fake',
+      workingDirectories: [pathToFileURL(process.cwd()).href],
+    }),
+    /requires authentication\. Sign in with ".*" in a terminal or configure the required API key\/credentials/,
   );
 });
 

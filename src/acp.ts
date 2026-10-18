@@ -94,6 +94,7 @@ class AcpV1Process implements AcpAdapter {
   private context: acp.ClientContext | undefined;
   private connectPromise: Promise<unknown> | undefined;
   private startupError: Error | undefined;
+  private advertisedAuthMethods: acp.AuthMethod[] = [];
   private ready = false;
   private stopResolve: (() => void) | undefined;
   private stderrTail = '';
@@ -156,7 +157,7 @@ class AcpV1Process implements AcpAdapter {
       this.stderrTail = (this.stderrTail + chunk).slice(-this.provider.stderrTailBytes);
     });
     this.child.once('error', (error) => {
-      this.startupError = error;
+      this.startupError ??= error;
     });
     this.child.once('exit', (code, signal) => {
       const wasReady = this.ready;
@@ -172,7 +173,7 @@ class AcpV1Process implements AcpAdapter {
         if (wasReady) {
           this.callbacks.crashed(error);
         } else {
-          this.startupError = error;
+          this.startupError ??= error;
         }
       }
       this.stopResolve?.();
@@ -204,6 +205,9 @@ class AcpV1Process implements AcpAdapter {
             },
           },
         });
+        this.advertisedAuthMethods = Array.isArray(initialized.authMethods)
+          ? initialized.authMethods
+          : [];
         const loadSupported = initialized.agentCapabilities?.loadSession === true;
         const promptCaps = initialized.agentCapabilities?.promptCapabilities;
         const promptCapabilities = promptCaps
@@ -252,7 +256,7 @@ class AcpV1Process implements AcpAdapter {
         return null;
       });
     this.connectPromise.catch((error: unknown) => {
-      this.startupError = asError(error);
+      this.startupError ??= asError(error);
     });
     try {
       await withTimeout(this.waitForReady(), this.provider.startupTimeoutMs, 'ACP startup');
@@ -954,14 +958,36 @@ class AcpV1Process implements AcpAdapter {
   }
 
   private reportStartupFailure(cause: unknown): Error {
-    const message = asError(cause).message;
-    if (/auth(?:entication)?(?: is)? required|auth_required/i.test(message)) {
+    const primaryError = this.startupError ?? cause;
+    const message = asError(primaryError).message;
+    const combinedMessage = `${message}\n${asError(cause).message}\n${this.stderrTail}`;
+    const errnoCode = (primaryError as NodeJS.ErrnoException | undefined)?.code
+      ?? (cause as NodeJS.ErrnoException | undefined)?.code;
+    if (errnoCode === 'ENOENT' || /\bspawn\s+\S+\s+ENOENT\b/i.test(combinedMessage)) {
       const correlationId = crypto.randomUUID();
-      console.error(`[${correlationId}] ACP provider ${this.provider.displayName} (${this.provider.id}) requires authentication: ${message}`);
-      const hint = this.provider.authHint ? ` ${this.provider.authHint}` : '';
-      return new Error(`ACP provider ${this.provider.displayName} (${this.provider.id}) requires authentication.${hint}`);
+      const executable = resolveProviderExecutable(this.provider);
+      console.error(
+        `[${correlationId}] ACP provider ${this.provider.displayName} (${this.provider.id}) executable not found (${executable}): ${message}`,
+      );
+      const hint = this.provider.installHint ? ` ${this.provider.installHint}` : '';
+      return new Error(
+        `ACP provider ${this.provider.displayName} (${this.provider.id}) executable "${executable}" was not found on PATH (reference ${correlationId}).${hint}`,
+      );
     }
-    return this.reportFailure('failed during startup', cause);
+    if (
+      /auth(?:entication)?(?: is)? required|auth_required|not authenticated|not logged in|please log ?in|missing (?:api[-_ ]?key|credentials)|invalid api[-_ ]?key|unauthorized/i.test(
+        combinedMessage,
+      )
+    ) {
+      const correlationId = crypto.randomUUID();
+      const stderr = this.stderrTail ? `\nstderr tail:\n${this.stderrTail}` : '';
+      console.error(
+        `[${correlationId}] ACP provider ${this.provider.displayName} (${this.provider.id}) requires authentication: ${message}${stderr}`,
+      );
+      const guidance = this.provider.authHint ?? formatAuthGuidance(this.provider, this.advertisedAuthMethods);
+      return new Error(`ACP provider ${this.provider.displayName} (${this.provider.id}) requires authentication. ${guidance}`);
+    }
+    return this.reportFailure('failed during startup', primaryError);
   }
 
   private closePermissions(): void {
@@ -990,6 +1016,31 @@ class AcpV1Process implements AcpAdapter {
       delay(Math.min(this.provider.shutdownTimeoutMs, 1_000)),
     ]);
   }
+}
+
+export function formatAuthGuidance(
+  provider: Pick<ProviderConfig, 'displayName' | 'command' | 'args'>,
+  authMethods: ReadonlyArray<acp.AuthMethod> = [],
+): string {
+  const methodLabels = authMethods
+    .map((method) => {
+      const name = typeof method.name === 'string' ? method.name.trim() : '';
+      const desc = typeof method.description === 'string' ? method.description.trim() : '';
+      return desc ? `${name} (${desc})` : name;
+    })
+    .filter((label) => label.length > 0);
+  if (methodLabels.length > 0) {
+    return `Sign in or configure credentials for ${provider.displayName} (available auth methods: ${methodLabels.join(', ')}) and retry the session.`;
+  }
+  const baseCommand = deriveInteractiveCliCommand(provider);
+  return `Sign in with "${baseCommand}" in a terminal or configure the required API key/credentials in the environment, then retry the session.`;
+}
+
+function deriveInteractiveCliCommand(
+  provider: Pick<ProviderConfig, 'command' | 'args'>,
+): string {
+  const filteredArgs = provider.args.filter((arg) => !/^(--acp|--experimental-acp|--experimental-skills|acp)$/i.test(arg));
+  return [provider.command, ...filteredArgs].join(' ').trim();
 }
 
 export function resolveProviderExecutable(

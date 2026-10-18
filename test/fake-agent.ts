@@ -58,7 +58,9 @@ acp.agent({ name: 'ahp-acp-gateway-test-agent' })
             embeddedContext: true,
           },
     },
-    authMethods: [],
+    authMethods: process.argv.includes('--auth-methods')
+      ? [{ id: 'oauth', name: 'OAuth Login', description: 'Browser sign-in' }]
+      : [],
   }))
   .onRequest(acp.methods.agent.session.new, () => {
     if (process.argv.includes('--auth-required')) {
