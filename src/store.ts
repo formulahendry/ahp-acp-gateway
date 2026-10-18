@@ -75,6 +75,11 @@ export interface StoredFileEditSnapshot {
 export class GatewayStore {
   readonly db: DatabaseSync;
   readonly replayLimit: number;
+  private currentServerSeq = 0;
+  private persistedServerSeq = 0;
+  private readonly actionLog: ActionEnvelope[] = [];
+  private readonly ephemeralChannels = new Map<string, { kind: ChannelKind; state: ChannelState }>();
+  private readonly dirtyChats = new Map<string, ChatState>();
 
   constructor(path: string, replayLimit: number) {
     this.db = new DatabaseSync(path);
@@ -128,9 +133,14 @@ export class GatewayStore {
       INSERT OR IGNORE INTO metadata(key, value) VALUES ('serverSeq', '0');
     `);
     this.migrateTerminalChannelKind();
+    this.db.exec(`DELETE FROM channels WHERE kind IN ('terminal', 'resourceWatch')`);
+    const row = this.db.prepare(`SELECT value FROM metadata WHERE key='serverSeq'`).get() as { value: string };
+    this.currentServerSeq = Number(row.value);
+    this.persistedServerSeq = this.currentServerSeq;
   }
 
   close(): void {
+    this.flushDirtyState();
     this.db.close();
   }
 
@@ -172,11 +182,14 @@ export class GatewayStore {
   }
 
   get serverSeq(): number {
-    const row = this.db.prepare(`SELECT value FROM metadata WHERE key='serverSeq'`).get() as { value: string };
-    return Number(row.value);
+    return this.currentServerSeq;
   }
 
   getChannel(uri: string): ChannelState | undefined {
+    const ephemeral = this.ephemeralChannels.get(uri);
+    if (ephemeral) return ephemeral.state;
+    const dirtyChat = this.dirtyChats.get(uri);
+    if (dirtyChat) return dirtyChat;
     const row = this.db.prepare(`SELECT state_json FROM channels WHERE uri=?`).get(uri) as
       | { state_json: string }
       | undefined;
@@ -184,6 +197,9 @@ export class GatewayStore {
   }
 
   getChannelKind(uri: string): ChannelKind | undefined {
+    const ephemeral = this.ephemeralChannels.get(uri);
+    if (ephemeral) return ephemeral.kind;
+    if (this.dirtyChats.has(uri)) return 'chat';
     const row = this.db.prepare(`SELECT kind FROM channels WHERE uri=?`).get(uri) as
       | { kind: ChannelKind }
       | undefined;
@@ -212,6 +228,7 @@ export class GatewayStore {
   }
 
   putChat(chat: StoredChat): void {
+    this.dirtyChats.delete(chat.resource);
     const json = JSON.stringify(chat.state);
     this.transaction(() => {
       this.db.prepare(
@@ -238,7 +255,7 @@ export class GatewayStore {
       activeSessions: this.sessionCount() + 1,
     } as StateAction;
     const nextRoot = rootReducer(root, action as never);
-    const nextSeq = this.serverSeq + 1;
+    const nextSeq = this.currentServerSeq + 1;
     const envelope: ActionEnvelope = {
       channel: 'ahp-root://',
       action,
@@ -247,7 +264,6 @@ export class GatewayStore {
     };
     const sessionJson = JSON.stringify(session.state);
     const chatJson = JSON.stringify(chat.state);
-    const now = new Date().toISOString();
 
     this.transaction(() => {
       this.db.prepare(
@@ -265,19 +281,27 @@ export class GatewayStore {
       ).run(chat.resource, chatJson);
       this.db.prepare(`UPDATE channels SET state_json=? WHERE uri='ahp-root://'`).run(JSON.stringify(nextRoot));
       this.db.prepare(`UPDATE metadata SET value=? WHERE key='serverSeq'`).run(String(nextSeq));
-      this.db.prepare(
-        `INSERT INTO actions(server_seq, channel, envelope_json, created_at) VALUES (?, ?, ?, ?)`,
-      ).run(nextSeq, 'ahp-root://', JSON.stringify(envelope), now);
-      this.trimActions();
     });
+    this.dirtyChats.delete(chat.resource);
+    this.currentServerSeq = nextSeq;
+    this.persistedServerSeq = nextSeq;
+    this.recordActionEnvelope(envelope);
     return envelope;
   }
 
   clearTerminals(): void {
+    this.ephemeralChannels.clear();
     this.db.prepare(`DELETE FROM channels WHERE kind IN ('terminal', 'resourceWatch')`).run();
   }
 
   putChannel(uri: string, kind: ChannelKind, state: ChannelState): void {
+    if (isEphemeralChannelKind(kind)) {
+      this.ephemeralChannels.set(uri, { kind, state });
+      return;
+    }
+    if (kind === 'chat') {
+      this.dirtyChats.delete(uri);
+    }
     this.db.prepare(
       `INSERT INTO channels(uri, kind, state_json) VALUES (?, ?, ?)
        ON CONFLICT(uri) DO UPDATE SET kind=excluded.kind, state_json=excluded.state_json`,
@@ -285,17 +309,28 @@ export class GatewayStore {
   }
 
   deleteChannel(uri: string): void {
+    if (this.ephemeralChannels.delete(uri)) return;
+    this.dirtyChats.delete(uri);
     this.db.prepare(`DELETE FROM channels WHERE uri=?`).run(uri);
   }
 
   listChannelsByKind(kind: ChannelKind): Array<{ uri: string; state: ChannelState }> {
+    if (isEphemeralChannelKind(kind)) {
+      const results: Array<{ uri: string; state: ChannelState }> = [];
+      for (const [uri, entry] of this.ephemeralChannels.entries()) {
+        if (entry.kind === kind) results.push({ uri, state: entry.state });
+      }
+      return results;
+    }
     const rows = this.db.prepare(`SELECT uri, state_json FROM channels WHERE kind=?`).all(kind) as Array<{
       uri: string;
       state_json: string;
     }>;
     return rows.map((row) => ({
       uri: row.uri,
-      state: JSON.parse(row.state_json) as ChannelState,
+      state: kind === 'chat' && this.dirtyChats.has(row.uri)
+        ? this.dirtyChats.get(row.uri)!
+        : JSON.parse(row.state_json) as ChannelState,
     }));
   }
 
@@ -311,24 +346,17 @@ export class GatewayStore {
       terminals: [...(root.terminals ?? []), info],
     } as StateAction;
     const nextRoot = rootReducer(root, action as never);
-    const nextSeq = this.serverSeq + 1;
+    const nextSeq = this.currentServerSeq + 1;
     const envelope: ActionEnvelope = {
       channel: 'ahp-root://',
       action,
       serverSeq: nextSeq,
       origin: undefined,
     };
-    this.transaction(() => {
-      this.db.prepare(
-        `INSERT INTO channels(uri, kind, state_json) VALUES (?, 'terminal', ?)`,
-      ).run(uri, JSON.stringify(state));
-      this.db.prepare(`UPDATE channels SET state_json=? WHERE uri='ahp-root://'`).run(JSON.stringify(nextRoot));
-      this.db.prepare(`UPDATE metadata SET value=? WHERE key='serverSeq'`).run(String(nextSeq));
-      this.db.prepare(
-        `INSERT INTO actions(server_seq, channel, envelope_json, created_at) VALUES (?, ?, ?, ?)`,
-      ).run(nextSeq, 'ahp-root://', JSON.stringify(envelope), new Date().toISOString());
-      this.trimActions();
-    });
+    this.ephemeralChannels.set(uri, { kind: 'terminal', state });
+    this.db.prepare(`UPDATE channels SET state_json=? WHERE uri='ahp-root://'`).run(JSON.stringify(nextRoot));
+    this.currentServerSeq = nextSeq;
+    this.recordActionEnvelope(envelope);
     return envelope;
   }
 
@@ -340,22 +368,17 @@ export class GatewayStore {
       terminals: (root.terminals ?? []).filter((terminal) => terminal.resource !== uri),
     } as StateAction;
     const nextRoot = rootReducer(root, action as never);
-    const nextSeq = this.serverSeq + 1;
+    const nextSeq = this.currentServerSeq + 1;
     const envelope: ActionEnvelope = {
       channel: 'ahp-root://',
       action,
       serverSeq: nextSeq,
       origin: undefined,
     };
-    this.transaction(() => {
-      this.db.prepare(`DELETE FROM channels WHERE uri=? AND kind='terminal'`).run(uri);
-      this.db.prepare(`UPDATE channels SET state_json=? WHERE uri='ahp-root://'`).run(JSON.stringify(nextRoot));
-      this.db.prepare(`UPDATE metadata SET value=? WHERE key='serverSeq'`).run(String(nextSeq));
-      this.db.prepare(
-        `INSERT INTO actions(server_seq, channel, envelope_json, created_at) VALUES (?, ?, ?, ?)`,
-      ).run(nextSeq, 'ahp-root://', JSON.stringify(envelope), new Date().toISOString());
-      this.trimActions();
-    });
+    this.ephemeralChannels.delete(uri);
+    this.db.prepare(`UPDATE channels SET state_json=? WHERE uri='ahp-root://'`).run(JSON.stringify(nextRoot));
+    this.currentServerSeq = nextSeq;
+    this.recordActionEnvelope(envelope);
     return envelope;
   }
 
@@ -378,7 +401,7 @@ export class GatewayStore {
       ...current.state,
       config,
     };
-    const nextSeq = this.serverSeq + 1;
+    const nextSeq = this.currentServerSeq + 1;
     const envelope: ActionEnvelope = {
       channel: uri,
       action,
@@ -391,11 +414,10 @@ export class GatewayStore {
       this.db.prepare(`UPDATE metadata SET value=? WHERE key='serverSeq'`).run(String(nextSeq));
       this.db.prepare(`UPDATE channels SET state_json=? WHERE uri=?`).run(json, uri);
       this.db.prepare(`UPDATE sessions SET state_json=?, modified_at=? WHERE resource=?`).run(json, now, uri);
-      this.db.prepare(
-        `INSERT INTO actions(server_seq, channel, envelope_json, created_at) VALUES (?, ?, ?, ?)`,
-      ).run(nextSeq, uri, JSON.stringify(envelope), now);
-      this.trimActions();
     });
+    this.currentServerSeq = nextSeq;
+    this.persistedServerSeq = nextSeq;
+    this.recordActionEnvelope(envelope);
     return envelope;
   }
 
@@ -405,14 +427,14 @@ export class GatewayStore {
     ).get(uri) as
       | { resource: string; session_uri: string; state_json: string; binding_json: string | null }
       | undefined;
-    return row
-      ? {
-          resource: row.resource,
-          session: row.session_uri,
-          state: JSON.parse(row.state_json) as ChatState,
-          binding: row.binding_json ? JSON.parse(row.binding_json) as AcpBinding : undefined,
-        }
-      : undefined;
+    if (!row) return undefined;
+    const dirtyState = this.dirtyChats.get(uri);
+    return {
+      resource: row.resource,
+      session: row.session_uri,
+      state: dirtyState ?? (JSON.parse(row.state_json) as ChatState),
+      binding: row.binding_json ? JSON.parse(row.binding_json) as AcpBinding : undefined,
+    };
   }
 
   getSession(uri: string): StoredSession | undefined {
@@ -462,6 +484,7 @@ export class GatewayStore {
         resource: string;
       }>;
       for (const chatRow of chatRows) {
+        this.dirtyChats.delete(chatRow.resource);
         this.db.prepare(`DELETE FROM channels WHERE uri LIKE ?`).run(`${chatRow.resource}/changeset/%`);
       }
       this.db.prepare(`DELETE FROM channels WHERE uri LIKE ?`).run(`${uri}/changeset/%`);
@@ -570,6 +593,7 @@ export class GatewayStore {
   }
 
   deleteChat(uri: string): void {
+    this.dirtyChats.delete(uri);
     this.transaction(() => {
       this.db.prepare(`DELETE FROM channels WHERE uri LIKE ?`).run(`${uri}/changeset/%`);
       this.db.prepare(`DELETE FROM chats WHERE resource=?`).run(uri);
@@ -583,24 +607,50 @@ export class GatewayStore {
     const kind = this.getChannelKind(channel);
     if (!kind) throw new Error(`Unknown channel ${channel}`);
     const next = reduce(kind, current, action);
-    const nextSeq = this.serverSeq + 1;
+    const nextSeq = this.currentServerSeq + 1;
     const envelope: ActionEnvelope = { channel, action, serverSeq: nextSeq, origin };
+
+    if (isEphemeralChannelKind(kind)) {
+      this.ephemeralChannels.set(channel, { kind, state: next });
+      this.currentServerSeq = nextSeq;
+      this.recordActionEnvelope(envelope);
+      return envelope;
+    }
+
+    if (
+      kind === 'chat'
+      && (action.type === ActionType.ChatDelta || action.type === ActionType.ChatReasoning)
+    ) {
+      this.dirtyChats.set(channel, next as ChatState);
+      this.currentServerSeq = nextSeq;
+      this.recordActionEnvelope(envelope);
+      return envelope;
+    }
+
     const now = new Date().toISOString();
     const nextJson = JSON.stringify(next);
 
     this.transaction(() => {
       this.db.prepare(`UPDATE metadata SET value=? WHERE key='serverSeq'`).run(String(nextSeq));
       this.db.prepare(`UPDATE channels SET state_json=? WHERE uri=?`).run(nextJson, channel);
-      this.db.prepare(
-        `INSERT INTO actions(server_seq, channel, envelope_json, created_at) VALUES (?, ?, ?, ?)`,
-      ).run(nextSeq, channel, JSON.stringify(envelope), now);
       if (kind === 'session') {
         this.db.prepare(`UPDATE sessions SET state_json=?, modified_at=? WHERE resource=?`).run(nextJson, now, channel);
       } else if (kind === 'chat') {
         this.db.prepare(`UPDATE chats SET state_json=? WHERE resource=?`).run(nextJson, channel);
       }
-      this.trimActions();
+      if (kind === 'root') {
+        this.db.prepare(
+          `INSERT INTO actions(server_seq, channel, envelope_json, created_at) VALUES (?, ?, ?, ?)`,
+        ).run(nextSeq, channel, JSON.stringify(envelope), now);
+        this.trimActions();
+      }
     });
+    if (kind === 'chat') {
+      this.dirtyChats.delete(channel);
+    }
+    this.currentServerSeq = nextSeq;
+    this.persistedServerSeq = nextSeq;
+    this.recordActionEnvelope(envelope);
     return envelope;
   }
 
@@ -610,7 +660,7 @@ export class GatewayStore {
     origin: { clientId: string; clientSeq: number },
     rejectionReason: string,
   ): ActionEnvelope {
-    const nextSeq = this.serverSeq + 1;
+    const nextSeq = this.currentServerSeq + 1;
     const envelope: ActionEnvelope = {
       channel,
       action,
@@ -618,28 +668,64 @@ export class GatewayStore {
       origin,
       rejectionReason,
     };
-    this.transaction(() => {
-      this.db.prepare(`UPDATE metadata SET value=? WHERE key='serverSeq'`).run(String(nextSeq));
-      this.db.prepare(
-        `INSERT INTO actions(server_seq, channel, envelope_json, created_at) VALUES (?, ?, ?, ?)`,
-      ).run(nextSeq, channel, JSON.stringify(envelope), new Date().toISOString());
-      this.trimActions();
-    });
+    this.currentServerSeq = nextSeq;
+    this.recordActionEnvelope(envelope);
     return envelope;
   }
 
   actionsAfter(serverSeq: number, subscriptions: Set<string>): ActionEnvelope[] | undefined {
+    if (this.actionLog.length > 0) {
+      const oldestInMem = this.actionLog[0]!.serverSeq;
+      if (serverSeq >= oldestInMem - 1) {
+        return this.actionLog.filter(
+          (envelope) => envelope.serverSeq > serverSeq && subscriptions.has(envelope.channel),
+        );
+      }
+      if (this.actionLog.length >= this.replayLimit) {
+        return undefined;
+      }
+    }
     const oldest = this.db.prepare(`SELECT MIN(server_seq) AS seq FROM actions`).get() as { seq: number | null };
     if (oldest.seq !== null && serverSeq < oldest.seq - 1) return undefined;
     const rows = this.db.prepare(
       `SELECT envelope_json FROM actions WHERE server_seq > ? ORDER BY server_seq`,
     ).all(serverSeq) as Array<{ envelope_json: string }>;
-    return rows
-      .map((row) => JSON.parse(row.envelope_json) as ActionEnvelope)
-      .filter((envelope) => subscriptions.has(envelope.channel));
+    const persisted = rows.map((row) => JSON.parse(row.envelope_json) as ActionEnvelope);
+    const maxPersisted = persisted.length > 0 ? persisted[persisted.length - 1]!.serverSeq : serverSeq;
+    const combined = [
+      ...persisted,
+      ...this.actionLog.filter((envelope) => envelope.serverSeq > maxPersisted),
+    ];
+    return combined.filter((envelope) => subscriptions.has(envelope.channel));
+  }
+
+  flushDirtyState(): void {
+    if (this.dirtyChats.size === 0 && this.currentServerSeq === this.persistedServerSeq) {
+      return;
+    }
+    this.transaction(() => {
+      for (const [chatUri, state] of this.dirtyChats.entries()) {
+        const json = JSON.stringify(state);
+        this.db.prepare(`UPDATE channels SET state_json=? WHERE uri=?`).run(json, chatUri);
+        this.db.prepare(`UPDATE chats SET state_json=? WHERE resource=?`).run(json, chatUri);
+      }
+      if (this.currentServerSeq !== this.persistedServerSeq) {
+        this.db.prepare(`UPDATE metadata SET value=? WHERE key='serverSeq'`).run(String(this.currentServerSeq));
+      }
+    });
+    this.dirtyChats.clear();
+    this.persistedServerSeq = this.currentServerSeq;
+  }
+
+  private recordActionEnvelope(envelope: ActionEnvelope): void {
+    this.actionLog.push(envelope);
+    if (this.actionLog.length > this.replayLimit) {
+      this.actionLog.splice(0, this.actionLog.length - this.replayLimit);
+    }
   }
 
   repairInterruptedTurns(): ActionEnvelope[] {
+    this.flushDirtyState();
     const rows = this.db.prepare(
       `SELECT resource, session_uri, state_json FROM chats`,
     ).all() as Array<{ resource: string; session_uri: string; state_json: string }>;
@@ -734,6 +820,10 @@ export class GatewayStore {
       COMMIT;
     `);
   }
+}
+
+function isEphemeralChannelKind(kind: ChannelKind): boolean {
+  return kind === 'terminal' || kind === 'resourceWatch';
 }
 
 function reduce(kind: ChannelKind, state: ChannelState, action: StateAction): ChannelState {

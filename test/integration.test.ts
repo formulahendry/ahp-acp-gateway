@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { promisify } from 'node:util';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
@@ -16,7 +17,8 @@ import {
   MessageAttachmentKind,
   MessageKind,
   PROTOCOL_VERSION,
-  ResourceChangeType,
+   ResourceChangeType,
+  ResponsePartKind,
   SessionStatus,
   TerminalClaimKind,
   ToolCallConfirmationReason,
@@ -741,6 +743,141 @@ test('session and default chat creation is atomic on constraint failure', async 
     assert.equal(store.serverSeq, beforeSeq);
     assert.equal((store.getSnapshot('ahp-root://')?.state as any).activeSessions, 1);
     store.close();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('ephemeral channels and streaming chat deltas avoid per-token SQLite writes while flushing on completion or close', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'ahp-acp-gateway-store-ephemeral-'));
+  const database = join(directory, 'gateway.db');
+  try {
+    const store = new GatewayStore(database, 100);
+    store.ensureRoot({ agents: [], activeSessions: 0 });
+    const now = new Date().toISOString();
+    const session = storedSession('ahp-session:/streaming-one', 'ahp-chat:/streaming-one', now);
+    const chat = storedChat(session.resource, 'ahp-chat:/streaming-one', now);
+    store.createSession(session, chat);
+
+    const terminalUri = 'ahp-terminal:/term-1';
+    store.createTerminal(terminalUri, {
+      cols: 80,
+      rows: 24,
+      content: [],
+      lifecycle: 'running' as any,
+      claim: { kind: TerminalClaimKind.Client, clientId: 'test-client' } as any,
+      supportsCommandDetection: false,
+      isPty: false,
+    } as never, {
+      resource: terminalUri,
+      title: 'echo',
+      claim: { kind: TerminalClaimKind.Client, clientId: 'test-client' } as any,
+      lifecycle: 'running' as any,
+    });
+    store.apply(terminalUri, {
+      type: ActionType.TerminalData,
+      data: 'hello\n',
+    } as StateAction);
+
+    const watchUri = 'ahp-watch:/watch-1';
+    store.putChannel(watchUri, 'resourceWatch', {
+      root: 'file:///tmp',
+      recursive: true,
+    } satisfies ResourceWatchState);
+
+    store.apply(chat.resource, userTurn('turn-1', 'stream something'));
+    store.apply(chat.resource, {
+      type: ActionType.ChatResponsePart,
+      turnId: 'turn-1',
+      part: { kind: ResponsePartKind.Reasoning, id: 'part-r1', content: '' },
+    } as StateAction);
+    store.apply(chat.resource, {
+      type: ActionType.ChatReasoning,
+      turnId: 'turn-1',
+      partId: 'part-r1',
+      content: 'thinking...',
+    } as StateAction);
+    store.apply(chat.resource, {
+      type: ActionType.ChatResponsePart,
+      turnId: 'turn-1',
+      part: { kind: ResponsePartKind.Markdown, id: 'part-m1', content: '' },
+    } as StateAction);
+    store.apply(chat.resource, {
+      type: ActionType.ChatDelta,
+      turnId: 'turn-1',
+      partId: 'part-m1',
+      content: 'Hello ',
+    } as StateAction);
+    store.apply(chat.resource, {
+      type: ActionType.ChatDelta,
+      turnId: 'turn-1',
+      partId: 'part-m1',
+      content: 'world!',
+    } as StateAction);
+
+    // Live in-memory reads reflect every streaming chunk immediately
+    const liveChat = store.getChat(chat.resource)?.state;
+    assert.equal(liveChat?.activeTurn?.responseParts.length, 2);
+    assert.equal((liveChat?.activeTurn?.responseParts[1] as any)?.content, 'Hello world!');
+
+    // Inspect raw SQLite file before turn completion / close:
+    // 1. Ephemeral channels (terminal / resourceWatch) are not in `channels` table
+    // 2. Streaming ChatDelta / ChatReasoning have not been flushed to `chats` table yet
+    const rawDb = new DatabaseSync(database, { readOnly: true });
+    const channelRows = rawDb.prepare(`SELECT uri, kind FROM channels`).all() as Array<{ uri: string; kind: string }>;
+    assert.equal(channelRows.some((r) => r.uri === terminalUri || r.kind === 'terminal'), false);
+    assert.equal(channelRows.some((r) => r.uri === watchUri || r.kind === 'resourceWatch'), false);
+
+    const diskChatBeforeFlush = JSON.parse(
+      (rawDb.prepare(`SELECT state_json FROM chats WHERE resource=?`).get(chat.resource) as { state_json: string }).state_json,
+    ) as ChatState;
+    assert.equal((diskChatBeforeFlush.activeTurn?.responseParts[1] as any)?.content, '');
+    const actionRows = rawDb.prepare(`SELECT channel FROM actions`).all() as Array<{ channel: string }>;
+    assert.equal(actionRows.some((r) => r.channel === chat.resource || r.channel === terminalUri), false);
+
+    // Non-streaming action (ChatTurnComplete) flushes accumulated streaming state to SQLite
+    store.apply(chat.resource, {
+      type: ActionType.ChatTurnComplete,
+      turnId: 'turn-1',
+      duration: 12,
+    } as StateAction);
+
+    const diskChatAfterComplete = JSON.parse(
+      (rawDb.prepare(`SELECT state_json FROM chats WHERE resource=?`).get(chat.resource) as { state_json: string }).state_json,
+    ) as ChatState;
+    assert.equal(diskChatAfterComplete.turns.length, 1);
+    assert.equal((diskChatAfterComplete.turns[0]?.responseParts[1] as any)?.content, 'Hello world!');
+
+    // Also verify store.close() flushes mid-turn dirty state if closed during streaming
+    store.apply(chat.resource, userTurn('turn-2', 'second turn'));
+    store.apply(chat.resource, {
+      type: ActionType.ChatResponsePart,
+      turnId: 'turn-2',
+      part: { kind: ResponsePartKind.Markdown, id: 'part-m2', content: '' },
+    } as StateAction);
+    store.apply(chat.resource, {
+      type: ActionType.ChatDelta,
+      turnId: 'turn-2',
+      partId: 'part-m2',
+      content: 'partial before close',
+    } as StateAction);
+    rawDb.close();
+    store.close();
+
+    // Simulate legacy DB rows for terminal / resourceWatch to verify startup cleanup
+    const legacyDb = new DatabaseSync(database);
+    legacyDb.prepare(`INSERT INTO channels(uri, kind, state_json) VALUES (?, 'terminal', '{}')`).run('ahp-terminal:/legacy');
+    legacyDb.prepare(`INSERT INTO channels(uri, kind, state_json) VALUES (?, 'resourceWatch', '{}')`).run('ahp-watch:/legacy');
+    legacyDb.close();
+
+    const reopened = new GatewayStore(database, 100);
+    assert.equal(reopened.getChannel(terminalUri), undefined);
+    assert.equal(reopened.getChannel(watchUri), undefined);
+    assert.equal(reopened.getChannel('ahp-terminal:/legacy'), undefined);
+    assert.equal(reopened.getChannel('ahp-watch:/legacy'), undefined);
+    const reopenedChat = reopened.getChat(chat.resource)?.state;
+    assert.equal((reopenedChat?.activeTurn?.responseParts[0] as any)?.content, 'partial before close');
+    reopened.close();
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
