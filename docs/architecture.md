@@ -12,9 +12,10 @@ flowchart LR
 ```
 
 `GatewayServer` handles authentication, JSON-RPC validation, subscriptions,
-commands, and notifications. `GatewayStore` is authoritative: it persists the
-next sequence number, action envelope, reduced channel state, catalog metadata,
-transcripts, and ACP bindings before an action is broadcast.
+commands, and notifications. `GatewayStore` is authoritative: it sequences every
+action envelope, keeps ephemeral channels (`terminal`, `resourceWatch`) and
+live streaming chunks in memory, and persists durable channel state, catalog
+metadata, transcripts, file-edit snapshots, and ACP bindings to SQLite.
 
 `AcpAdapterFactory` is the process-sharing seam. The MVP creates
 `AcpV1Process` per chat; a future factory can share one provider process without
@@ -59,9 +60,12 @@ complete ACP responses refresh dependent options and model availability.
 ## Ordering and replay
 
 Every accepted or rejected client action and every server action receives one
-monotonic `serverSeq`. SQLite commits the sequence, envelope, and reduced state
-in one immediate transaction. Subscribers receive the envelope only after the
-commit.
+monotonic `serverSeq` and enters the bounded in-memory replay buffer. Durable
+channel updates commit their reduced state and `serverSeq` to SQLite in one
+immediate transaction, while high-frequency streaming `chat/delta` and
+`chat/reasoning` chunks are coalesced in memory and flushed on non-streaming
+actions or shutdown. Ephemeral channels (`terminal` and `resourceWatch`) remain
+in memory only.
 
 Session creation inserts the session row, default chat row, both channel
 snapshots, the root active-session update, and its action envelope in one SQLite

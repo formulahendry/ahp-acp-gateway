@@ -1,6 +1,6 @@
 {
   "name": "ahp-acp-gateway",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Universal AHP server that connects Agent Host Protocol clients to ACP v1 agents",
   "type": "module",
   "license": "MIT",

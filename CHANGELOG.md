@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.2.2
+
+- Explicit missing-executable diagnostics (`ENOENT`) and zero-config
+  authentication guidance when ACP providers fail to start or exit with
+  unauthenticated errors (deriving login hints from ACP `authMethods` or the
+  provider launcher without requiring custom `authHint` configuration)
+- Reduced SQLite write amplification by keeping ephemeral channels (`terminal`,
+  `resourceWatch`) and the action replay ring buffer in memory, and coalescing
+  streaming `chat/delta` and `chat/reasoning` updates until non-streaming
+  checkpoints or shutdown
+
 ## 0.2.1
 
 - Multimodal message attachment support (`Message.attachments` -> ACP
