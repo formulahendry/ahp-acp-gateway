@@ -1,6 +1,7 @@
 # AHP-ACP Gateway
 
 [![npm version](https://img.shields.io/npm/v/ahp-acp-gateway.svg)](https://www.npmjs.com/package/ahp-acp-gateway)
+[![NPM Downloads](https://img.shields.io/npm/d18m/ahp-acp-gateway)](https://www.npmjs.com/package/ahp-acp-gateway)
 [![CI](https://github.com/formulahendry/ahp-acp-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/formulahendry/ahp-acp-gateway/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
