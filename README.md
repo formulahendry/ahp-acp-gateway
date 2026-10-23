@@ -105,6 +105,50 @@ npm install --global ahp-acp-gateway
 ahp-acp-gateway
 ```
 
+## Docker & Cloud Deployment (Azure Container Apps)
+
+A pre-built container image (`ghcr.io/formulahendry/ahp-acp-gateway:latest`) is
+published with Node.js 24 and **OpenCode** (`@opencode/cli`) pre-installed, so
+you can run a cloud or container gateway out of the box using OpenCode's free
+built-in models without configuring external API keys.
+
+### One-click deploy to Azure Container Apps
+
+[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fformulahendry%2Fahp-acp-gateway%2Fmain%2Fdeploy%2Fazuredeploy.json)
+
+1. Click **Deploy to Azure** above.
+2. Choose a Resource Group and enter an **`authToken`** (minimum 8 characters).
+3. Once deployed, open the deployment **Outputs** tab in the Azure Portal to
+   copy `vscodeRemoteAgentHostAddress` (`wss://<fqdn>/ahp?token=<YOUR_AUTH_TOKEN>`)
+   and add it to `chat.remoteAgentHosts` in VS Code.
+
+### Run with Docker
+
+```sh
+docker run --rm -p 8765:8765 \
+  -e AHP_AUTH_TOKEN="replace-with-your-secret-token" \
+  ghcr.io/formulahendry/ahp-acp-gateway:latest
+```
+
+Connect your AHP client to:
+
+```text
+ws://127.0.0.1:8765/ahp?token=replace-with-your-secret-token
+```
+
+Supported container environment variables:
+
+- `AHP_AUTH_TOKEN` (**required** when `AHP_HOST` is not loopback): Bearer or
+  `?token=` secret required by AHP clients.
+- `PORT` (default `8765`): HTTP / WebSocket listen port.
+- `AHP_ENABLED_PROVIDERS` (default `opencode`): Comma-separated list of ACP
+  provider IDs to enable, or `*` to enable all built-in providers.
+- `AHP_DEFAULT_CWD` (default `/workspace/demo`): Default working directory for
+  enabled providers inside the container.
+- `AHP_DB_PATH` (default `/data/ahp-acp-gateway.db`): SQLite database path.
+- `AHP_ALLOW_ANY_ORIGIN` (default `true`) and `AHP_ALLOWED_ORIGINS`
+  (comma-separated Origin allowlist).
+
 ## Features
 
 - AHP JSON-RPC over WebSocket
