@@ -8,6 +8,16 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+    paths:
+      - 'Dockerfile'
+      - 'docker/**'
+      - 'src/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
+      - 'ahp-acp-gateway.default.json'
+      - 'ahp-acp-gateway.example.json'
+      - '.github/workflows/container.yml'
   workflow_dispatch:
 
 concurrency:
