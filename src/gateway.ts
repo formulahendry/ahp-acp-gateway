@@ -901,7 +901,7 @@ export class GatewayServer {
         }
         const accepted = this.store.apply(channel, action, origin);
         this.broadcastAction(accepted);
-        this.syncChatSummary(chat.session, channel);
+        this.syncChatSummary(chat.session, channel, action);
         const adapter = this.getAdapter(channel);
         void this.runPrompt(channel, adapter, action);
         return;
@@ -913,7 +913,7 @@ export class GatewayServer {
         }
         const accepted = this.store.apply(channel, action, origin);
         this.broadcastAction(accepted);
-        this.syncChatSummary(chat.session, channel);
+        this.syncChatSummary(chat.session, channel, action);
         void this.refreshSessionChangesets(chat.session, action.turnId);
         const adapter = this.getAdapter(channel);
         void this.cleanupCancelledAdapter(channel, adapter);
@@ -956,7 +956,7 @@ export class GatewayServer {
       case ActionType.ChatTruncated: {
         const accepted = this.store.apply(channel, action, origin);
         this.broadcastAction(accepted);
-        this.syncChatSummary(chat.session, channel);
+        this.syncChatSummary(chat.session, channel, action);
         return;
       }
       default: {
@@ -991,7 +991,7 @@ export class GatewayServer {
         emit: (action) => {
           const envelope = this.store.apply(chatResource, action);
           this.broadcastAction(envelope);
-          this.syncChatSummary(chat.session, chatResource);
+          this.syncChatSummary(chat.session, chatResource, action);
           if (
             action.type === ActionType.ChatToolCallComplete
             || action.type === ActionType.ChatTurnComplete
@@ -1018,6 +1018,7 @@ export class GatewayServer {
                 },
               } as StateAction);
               this.broadcastAction(envelope);
+              this.syncChatSummary(chat.session, chatResource, envelope.action);
             }
           }
         },
@@ -1114,7 +1115,7 @@ export class GatewayServer {
             },
           } as StateAction);
           this.broadcastAction(envelope);
-          this.syncChatSummary(chat.session, chatResource);
+          this.syncChatSummary(chat.session, chatResource, envelope.action);
         },
         invalidated: () => {
           if (this.adapters.get(chatResource) === holder.adapter) this.adapters.delete(chatResource);
@@ -1842,7 +1843,7 @@ export class GatewayServer {
         },
       } as StateAction);
       this.broadcastAction(envelope);
-      this.syncChatSummary(chat.session, chatResource);
+      this.syncChatSummary(chat.session, chatResource, envelope.action);
     }
   }
 
@@ -2157,9 +2158,12 @@ export class GatewayServer {
     this.broadcastAction(rootEnvelope);
   }
 
-  private syncChatSummary(sessionResource: string, chatResource: string): void {
+  private syncChatSummary(sessionResource: string, chatResource: string, trigger?: StateAction): void {
     const chat = this.store.getChat(chatResource);
     if (!chat) return;
+    const previousChatStatus = this.store
+      .getSession(sessionResource)
+      ?.state.chats.find((item) => item.resource === chatResource)?.status;
     const modifiedAt = new Date().toISOString();
     const envelope = this.store.apply(sessionResource, {
       type: ActionType.SessionChatUpdated,
@@ -2171,6 +2175,7 @@ export class GatewayServer {
       },
     } as StateAction);
     this.broadcastAction(envelope);
+    this.syncSessionReadFlag(sessionResource, previousChatStatus, chat.state.status, trigger);
     const session = this.store.getSession(sessionResource);
     if (session) {
       const defaultChatSummary = session.state.chats.find(
@@ -2194,6 +2199,41 @@ export class GatewayServer {
         },
       });
     }
+  }
+
+  /**
+   * Keeps the session read flag aligned with its chats. Only a real read-bit
+   * transition moves the session flag, so unrelated chat updates never undo an
+   * explicit `session/isReadChanged`. An explicit read on a sole chat also
+   * repairs a session that an older host left unread.
+   *
+   * The caller (`syncChatSummary`) publishes the consolidated root summary, so
+   * this does not broadcast one of its own.
+   */
+  private syncSessionReadFlag(
+    sessionResource: string,
+    previousChatStatus: SessionStatus | undefined,
+    nextChatStatus: SessionStatus,
+    trigger: StateAction | undefined,
+  ): void {
+    const wasRead = ((previousChatStatus ?? SessionStatus.Idle) & SessionStatus.IsRead) !== 0;
+    const isRead = (nextChatStatus & SessionStatus.IsRead) !== 0;
+    if (wasRead === isRead && !(isRead && trigger?.type === ActionType.ChatIsReadChanged)) return;
+    const session = this.store.getSession(sessionResource);
+    if (!session) return;
+    const sessionRead = (session.state.status & SessionStatus.IsRead) !== 0;
+    if (sessionRead === isRead) return;
+    if (isRead) {
+      // A redundant read keeps a multi-chat session unread.
+      const chats = session.state.chats;
+      if (wasRead && chats.length > 1) return;
+      if (!chats.every((item) => (((item.status ?? SessionStatus.Idle) & SessionStatus.IsRead) !== 0))) return;
+    }
+    const envelope = this.store.apply(sessionResource, {
+      type: ActionType.SessionIsReadChanged,
+      isRead,
+    } as StateAction);
+    this.broadcastAction(envelope);
   }
 
   private resolveProvider(value: unknown): ProviderConfig {

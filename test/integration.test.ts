@@ -238,6 +238,78 @@ test('permission requests are first-answer-wins', async (t) => {
   assert.match(text ?? '', /permission:allow/);
 });
 
+test('chat read state keeps the session read flag in sync', async (t) => {
+  const fixture = await startFixture();
+  t.after(fixture.close);
+  const client = await connectClient(fixture.url, 'read-state');
+  t.after(() => client.shutdown());
+  const { session, chat } = await createSession(client, 'read');
+  const chatSub = (await client.subscribe(chat)).subscription;
+  const rootSub = client.attachSubscription('ahp-root://');
+
+  const summaryStatuses: Array<number | undefined> = [];
+  const pumping = (async () => {
+    try {
+      for (;;) {
+        const event = await rootSub.next();
+        if (event.done) return;
+        if (event.value.type === 'sessionSummaryChanged' && event.value.params.session === session) {
+          summaryStatuses.push(event.value.params.changes.status);
+        }
+      }
+    } catch {
+      // Subscription is closed when the test finishes.
+    }
+  })();
+  t.after(async () => {
+    await rootSub.close();
+    await pumping;
+  });
+
+  const sessionStatus = () => fixture.server.store.getSession(session)?.state.status ?? 0;
+  const chatStatus = () => fixture.server.store.getChat(chat)?.state.status ?? 0;
+  const draft = (text: string) => ({ type: ActionType.ChatDraftChanged, draft: { text } } as unknown as StateAction);
+  const readSummaries = () => summaryStatuses.filter((status) => ((status ?? 0) & SessionStatus.IsRead) !== 0).length;
+
+  summaryStatuses.length = 0;
+  client.dispatch(chat, { type: ActionType.ChatIsReadChanged, isRead: true } as StateAction);
+  await waitForCondition(() => (sessionStatus() & SessionStatus.IsRead) !== 0);
+  await waitForCondition(() => readSummaries() > 0);
+  assert.notEqual(chatStatus() & SessionStatus.IsRead, 0);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(readSummaries(), 1, 'a read transition publishes a single session summary');
+
+  // An explicit session read survives unrelated chat updates while the chat is unread.
+  client.dispatch(chat, { type: ActionType.ChatIsReadChanged, isRead: false } as StateAction);
+  await waitForCondition(() => (sessionStatus() & SessionStatus.IsRead) === 0);
+  client.dispatch(session, { type: ActionType.SessionIsReadChanged, isRead: true } as StateAction);
+  await waitForCondition(() => (sessionStatus() & SessionStatus.IsRead) !== 0);
+  client.dispatch(chat, draft('typing'));
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.notEqual(sessionStatus() & SessionStatus.IsRead, 0);
+  assert.equal(chatStatus() & SessionStatus.IsRead, 0);
+
+  // An explicit session unread survives unrelated chat updates while the chat is read.
+  client.dispatch(chat, { type: ActionType.ChatIsReadChanged, isRead: true } as StateAction);
+  await waitForCondition(() => (sessionStatus() & SessionStatus.IsRead) !== 0);
+  client.dispatch(session, { type: ActionType.SessionIsReadChanged, isRead: false } as StateAction);
+  await waitForCondition(() => (sessionStatus() & SessionStatus.IsRead) === 0);
+  client.dispatch(chat, draft('typing again'));
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(sessionStatus() & SessionStatus.IsRead, 0);
+
+  // A redundant explicit chat read repairs a sole chat's session left unread.
+  client.dispatch(chat, { type: ActionType.ChatIsReadChanged, isRead: true } as StateAction);
+  await waitForCondition(() => (sessionStatus() & SessionStatus.IsRead) !== 0);
+
+  // A new turn clears read state on the chat, and the session follows.
+  const turnId = crypto.randomUUID();
+  client.dispatch(chat, userTurn(turnId, 'hello'));
+  await waitForCondition(() => (sessionStatus() & SessionStatus.IsRead) === 0);
+  await nextAction(chatSub, (item) => item.action.type === ActionType.ChatTurnComplete);
+  assert.equal(sessionStatus() & SessionStatus.IsRead, 0);
+});
+
 test('browser origins are rejected unless explicitly allowed', async (t) => {
   const fixture = await startFixture();
   t.after(fixture.close);
