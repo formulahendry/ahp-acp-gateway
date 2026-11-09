@@ -465,7 +465,7 @@ export class GatewayServer {
     const sessions = this.store.listSessions(limit + 1, offset);
     const hasMore = sessions.length > limit;
     return {
-      items: sessions.slice(0, limit).map((session) => summary(session)),
+      items: sessions.slice(0, limit).map((session) => summary(session, this.sessionStatus(session.state))),
       ...(hasMore ? { nextCursor: encodeCursor(offset + limit) } : {}),
     };
   }
@@ -743,7 +743,7 @@ export class GatewayServer {
     this.broadcastAction(rootEnvelope);
     this.broadcast('ahp-root://', 'root/sessionAdded', {
       channel: 'ahp-root://',
-      summary: summary(session),
+      summary: summary(session, this.sessionStatus(session.state)),
     });
     const adapter = this.getAdapter(chatResource);
     try {
@@ -942,6 +942,7 @@ export class GatewayServer {
         }
         const accepted = this.store.apply(channel, normalizedAction, origin);
         this.broadcastAction(accepted);
+        this.syncChatSummary(chat.session, channel, normalizedAction);
         adapter.resolvePermission(
           normalizedAction.turnId,
           normalizedAction.toolCallId,
@@ -962,6 +963,7 @@ export class GatewayServer {
       default: {
         const accepted = this.store.apply(channel, action, origin);
         this.broadcastAction(accepted);
+        this.syncChatSummary(chat.session, channel, action);
       }
     }
   }
@@ -1195,7 +1197,7 @@ export class GatewayServer {
             channel: 'ahp-root://',
             session: sessionResource,
             changes: {
-              status: updated.state.status,
+              status: this.sessionStatus(updated.state),
               modifiedAt: new Date().toISOString(),
             },
           });
@@ -2158,6 +2160,34 @@ export class GatewayServer {
     this.broadcastAction(rootEnvelope);
   }
 
+  /**
+   * Aggregates a session's chat catalog into the session summary status:
+   * activity bits follow the default chat (else the most recently modified
+   * chat), `InputNeeded` and `Error` are promoted from any chat, and the
+   * session-owned `IsRead` / `IsArchived` flags pass through untouched.
+   *
+   * The aggregated value is projected into session summaries (`listSessions`,
+   * `root/sessionSummaryChanged`). `SessionState.status` itself stays whatever
+   * the session reducer produced, so subscribers that fold session actions
+   * never diverge from a fresh snapshot.
+   */
+  private sessionStatus(state: SessionState): SessionStatus {
+    const activityMask = (1 << 5) - 1;
+    const chats = state.chats ?? [];
+    if (chats.length === 0) return state.status;
+    const activityOf = (status: SessionStatus | undefined) => (status ?? SessionStatus.Idle) & activityMask;
+    const latestChat = [...chats].sort((a, b) => Date.parse(b.modifiedAt) - Date.parse(a.modifiedAt))[0];
+    const base = chats.find((item) => item.resource === state.defaultChat) ?? latestChat;
+    let activity = activityOf(base?.status);
+    if (chats.some((item) => activityOf(item.status) === SessionStatus.InputNeeded)) {
+      activity = SessionStatus.InputNeeded;
+    }
+    if (chats.some((item) => activityOf(item.status) === SessionStatus.Error)) {
+      activity = SessionStatus.Error;
+    }
+    return (state.status & ~activityMask) | activity;
+  }
+
   private syncChatSummary(sessionResource: string, chatResource: string, trigger?: StateAction): void {
     const chat = this.store.getChat(chatResource);
     if (!chat) return;
@@ -2185,7 +2215,7 @@ export class GatewayServer {
         channel: 'ahp-root://',
         session: sessionResource,
         changes: {
-          status: session.state.status,
+          status: this.sessionStatus(session.state),
           activity: session.state.activity,
           modifiedAt,
           ...(defaultChatSummary?.changes === undefined ? {} : { changes: defaultChatSummary.changes }),
@@ -2323,7 +2353,7 @@ function chatSummary(state: ChatState) {
   };
 }
 
-function summary(session: StoredSession) {
+function summary(session: StoredSession, status: SessionStatus = session.state.status) {
   const defaultChatSummary = session.state.chats.find(
     (item) => item.resource === (session.state.defaultChat ?? session.state.chats[0]?.resource),
   );
@@ -2331,7 +2361,7 @@ function summary(session: StoredSession) {
     resource: session.resource,
     provider: session.provider,
     title: session.state.title,
-    status: session.state.status,
+    status,
     ...(session.state.activity === undefined ? {} : { activity: session.state.activity }),
     ...(session.state.workingDirectories === undefined
       ? {}
