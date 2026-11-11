@@ -238,6 +238,67 @@ test('permission requests are first-answer-wins', async (t) => {
   assert.match(text ?? '', /permission:allow/);
 });
 
+test('session summary status mirrors default chat activity', async (t) => {
+  const fixture = await startFixture();
+  t.after(fixture.close);
+  const client = await connectClient(fixture.url, 'session-status');
+  t.after(() => client.shutdown());
+  const { session, chat } = await createSession(client, 'status');
+  const rootSub = client.attachSubscription('ahp-root://');
+  const chatSub = (await client.subscribe(chat)).subscription;
+
+  const summaryStatuses: Array<number | undefined> = [];
+  const pumping = (async () => {
+    try {
+      for (;;) {
+        const event = await rootSub.next();
+        if (event.done) return;
+        if (event.value.type === 'sessionSummaryChanged' && event.value.params.session === session) {
+          summaryStatuses.push(event.value.params.changes.status);
+        }
+      }
+    } catch {
+      // Subscription is closed when the test finishes.
+    }
+  })();
+  t.after(async () => {
+    await rootSub.close();
+    await pumping;
+  });
+
+  const turnId = crypto.randomUUID();
+  client.dispatch(chat, userTurn(turnId, 'permission'));
+  const ready = await nextAction(chatSub, (item) => item.action.type === ActionType.ChatToolCallReady);
+  const readyAction = ready.action as Extract<StateAction, { type: ActionType.ChatToolCallReady }>;
+  await waitForCondition(() => summaryStatuses.includes(SessionStatus.InProgress));
+  await waitForCondition(() => summaryStatuses.includes(SessionStatus.InputNeeded));
+
+  // Summaries aggregate the chat catalog while the session channel keeps the
+  // reducer value, so incremental subscribers never diverge from a snapshot.
+  assert.equal(fixture.server.store.getSession(session)?.state.status, SessionStatus.Idle);
+  const pending = await client.request('listSessions', { channel: 'ahp-root://' });
+  assert.equal(pending.items.find((item) => item.resource === session)?.status, SessionStatus.InputNeeded);
+
+  client.dispatch(chat, {
+    type: ActionType.ChatToolCallConfirmed,
+    turnId,
+    toolCallId: readyAction.toolCallId,
+    approved: true,
+    confirmed: ToolCallConfirmationReason.UserAction,
+    selectedOptionId: 'allow',
+  } as StateAction);
+  // The confirmation clears the pending gate, so the summary reports
+  // InProgress again before the provider emits its next action.
+  await waitForCondition(() => {
+    const tail = summaryStatuses.slice(summaryStatuses.lastIndexOf(SessionStatus.InputNeeded));
+    return tail.includes(SessionStatus.InProgress);
+  });
+  await nextAction(chatSub, (item) => item.action.type === ActionType.ChatTurnComplete);
+  await waitForCondition(() => summaryStatuses.at(-1) === SessionStatus.Idle);
+  const settled = await client.request('listSessions', { channel: 'ahp-root://' });
+  assert.equal(settled.items.find((item) => item.resource === session)?.status, SessionStatus.Idle);
+});
+
 test('chat read state keeps the session read flag in sync', async (t) => {
   const fixture = await startFixture();
   t.after(fixture.close);
